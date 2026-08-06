@@ -8,7 +8,7 @@ A personal [Claude Code](https://docs.claude.com/en/docs/claude-code) configurat
 
 If you build with AI every day, the bottleneck stops being *typing code* and becomes *keeping the work coherent*. The failure modes are specific and repeat:
 
-- **Too many overlapping agents, no clear owner.** You collect a dozen specialists and then freeze at the front door. Is this a `frontend-developer` job, a `make-interfaces-feel-better` job, or a `ui-ux-designer` job? Is restructuring a module `system-architect` or `backend-architect`? Does reviewing a diff go to `code-reviewer` or `gap-finder`? The names overlap, so you either pick wrong or pick nothing.
+- **Too many overlapping agents, no clear owner.** You collect a dozen specialists and then freeze at the front door. Is this a `frontend-developer` job, a `make-interfaces-feel-better` job, or a `ui-ux-designer` job? Is restructuring a module a `system-architect` job or an implementer's? Does reviewing a diff go to `/code-review` or `gap-finder`? The names overlap, so you either pick wrong or pick nothing.
 - **Every task gets the same process — or none.** A one-line copy tweak and a payments feature get treated identically. Either everything drowns in ceremony, or nothing does and the money-touching change ships with the same rigor as a rename.
 - **Survivorship bias / unknown-unknowns.** You handle the cases you can see and silently skip the ones you don't know you skipped: empty states, timezones and DST, idempotency and double-submit, back-compat migrations. Nothing reminds you of the case you forgot because you forgot it.
 - **Juggling 3–4 problems in one repo.** Parallel work in a single working tree means half-finished changes for different problems collide, and one commit clobbers another.
@@ -83,15 +83,15 @@ Real features run on **openspec** as the backbone: a local `openspec/` directory
 
 ```mermaid
 flowchart LR
-    EX[explore<br/>think, don't build<br/>2-3 approaches] --> PR[propose<br/>design + specs SHALL + tasks]
-    PR --> CR{critique layer<br/>system-architect<br/>+ gap-finder}
-    CR -->|gaps fold back| PR
-    CR --> AP[apply<br/>TDD · code-review · verify]
-    AP --> SC{long change?}
-    SC -->|yes| SY[sync-specs<br/>keep living spec current mid-flight]
-    SY --> AR
-    SC -->|no| AR[archive<br/>deltas to openspec/specs]
-    AR --> LS[(living spec<br/>single source of truth)]
+    EX[/opsx:explore<br/>think, don't build] --> PR[/opsx:propose<br/>proposal · specs · design]
+    PR --> RV{review<br/>adversarial gate<br/>VERDICT}
+    RV -->|REVISE| PR
+    RV -->|APPROVE| TP[test-plan<br/>every scenario → a named test]
+    TP --> AP[/opsx:apply<br/>red-green-refactor<br/>+ code-review + run it]
+    AP --> VF[/opsx:verify<br/>DECISION: PASS]
+    VF --> RT[retrospective<br/>§6 Promote → memory · rules · schema]
+    RT --> AR[/opsx:archive<br/>CLI merges the delta]
+    AR --> LS[(openspec/specs<br/>single source of truth)]
     LS -. next feature reads current truth .-> EX
 ```
 
@@ -126,7 +126,7 @@ Two rules live in that shared engine and pull in the same direction. **Docs lead
 
 Orient is a *phase*, not a lane that owns a standing artifact — it terminates and feeds the work downstream (an `audit-code` pass is the front half of adopting a brownfield project into openspec).
 
-**`adopt-code`** is the back half — turning an unspecced codebase into a living openspec baseline. Reverse-engineering can only produce *description* ("what the code does"), never *intent* ("what it SHALL do"), so the flow is two-status: archaeology drafts **descriptive** SHALLs per seam, each anchored to the code it was read from, and you **promote** the ones that are actually intended to **normative** — flagging the rest as bugs or deferring them. It also runs the *expected-but-absent* checklist, so a confirmed omission becomes an `unbacked` SHALL (a known gap that queues a feature) rather than staying invisible. A **conformance-sweep** then guards only the normative SHALLs across three axes — code↔spec, spec↔memory, memory↔code — at adoption and again as a gate on every later change to that seam, so the spec can't quietly drift from the code. The rhythm is hybrid: on-demand at the edge of work (a change to an unspecced seam wedges adoption first), with an optional full baseline pass. That closes the loop: **explore-code / audit-code → adopt-code → normal Lane C.**
+**Adoption is lazy, and deliberately so.** An unspecced seam is not archaeologised into a baseline before work can start — upstream's own rule applies: *you do not document your whole codebase to start, you write specs only for what you're about to change.* The spec thickens by traffic: an area becomes described after several changes have passed through it, not by a decision to document everything up front. An earlier design here reverse-engineered `descriptive` SHALLs per seam and promoted them to `normative` behind a conformance sweep; it was removed after measurement showed the status tags appeared in 2 of 24 capability specs — the work had been flowing through the simpler model anyway, and the archaeology was paying for itself only where a baseline was genuinely needed.
 
 ---
 
@@ -175,15 +175,14 @@ The overlaps that actually bite, resolved:
 | Build / add / change UI structure or wiring | `frontend-developer` | make-interfaces, ui-ux-designer |
 | UI works but "feels off / cheap" — spacing, radii, motion | `make-interfaces-feel-better` | frontend-developer |
 | "Is this the right flow / layout / accessible?" | `ui-ux-designer` | frontend-developer |
-| Whole-system shape, boundaries, "should this be split", file too big | `system-architect` | backend-architect |
-| Concrete API design, DB schema, endpoint/service design | `backend-architect` | system-architect |
-| What's **missing** (omissions, forgot-a-case) | `gap-finder` | code-reviewer |
+| Whole-system shape, boundaries, "should this be split", file too big | `system-architect` | `python-pro` (it implements; it does not decide shape) |
+| What's **missing** (omissions, forgot-a-case) | `gap-finder` | `/code-review` (it judges what is there) |
 | Bugs/correctness + quality of what's **there**, on the diff | `/code-review` (`ultra` = deep) | gap-finder |
 | Apply reuse/simplification/cleanup | `simplify` | /code-review |
-| Root-cause a bug / unexpected behavior | `systematic-debugging` | code-reviewer |
+| Root-cause a bug / unexpected behavior | `systematic-debugging` | `/code-review` |
 | Implement/optimize Python specifically | `python-pro` | frontend-developer |
-| Write/refresh docs, README, API docs | `documentation-expert` | copywriting |
-| Make a Russian text sound native (not translationese/канцелярит) | `dertext` | documentation-expert (explains), copywriting (sells) |
+| Write/refresh docs, README, API docs | no specialist — this is writing, not design | copywriting (it sells) |
+| Make a Russian text sound native (not translationese/канцелярит) | `dertext` | copywriting (it sells) |
 
 When two agents still fit, prefer the **narrower** one — and say why in the announce line.
 
