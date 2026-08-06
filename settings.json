@@ -1,4 +1,39 @@
 {
-  "theme": "auto",
-  "tui": "fullscreen"
+  "theme": "dark",
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": []
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "b=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) && n=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') && echo \"git: $b · $n uncommitted file(s)\" || true"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true,
+    "marketing-skills@marketingskills": true,
+    "self-learning@self-learning-skills": true
+  },
+  "extraKnownMarketplaces": {
+    "marketingskills": {
+      "source": {
+        "source": "github",
+        "repo": "coreyhaines31/marketingskills"
+      }
+    },
+    "self-learning-skills": {
+      "source": {
+        "source": "github",
+        "repo": "kulaxyz/self-learning-skills"
+      }
+    }
+  },
+  "skipWorkflowUsageWarning": true
 }
