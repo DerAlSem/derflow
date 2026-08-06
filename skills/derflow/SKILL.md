@@ -1,6 +1,6 @@
 ---
 name: derflow
-description: Use when starting any development task or request in one of the user's projects (GM+, романцова, пропевай, their Telegram/MAX bots) and it isn't yet obvious how to approach it — a feature, a small fix, a broken thing to diagnose, a prod incident, a deploy/migration/broadcast op, documentation, a throwaway spike, a "is this healthy / is this file too big" consult, a full audit, juggling several problems in one repo at once, a spec that has drifted from reality, or a plain question about the code. The single front door that decides approach, specialist, and how much process a task needs.
+description: Use when starting any development task or request in a code repository and it isn't yet obvious how to approach it — a feature, a small fix, a broken thing to diagnose, a prod incident, a deploy/migration/broadcast op, documentation, a throwaway spike, a "is this healthy / is this file too big" consult, a full audit, juggling several problems in one repo at once, a spec that has drifted from reality, or a plain question about the code. The single front door that decides approach, specialist, and how much process a task needs.
 ---
 
 # derflow — роутер
