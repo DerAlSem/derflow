@@ -54,20 +54,24 @@ The key move: **diagnosis, consults, audits, and spikes don't ship anything them
 
 ## The lanes
 
+A complaint about behaviour — "it's broken", "the link isn't there", "it shows the wrong thing" — **is not a lane by itself.** One symptom is three different tasks, and urgency does not tell them apart, so a **triage** runs first, cheapest question to dearest:
+
+1. **Does the domain even express the missing thing?** No → this is a model gap, not a bug → **C**.
+2. **Does the mechanism work but not reach the surface?** → **B**.
+3. **Is the mechanism breaking?** Only then does urgency branch: work is blocked right now → **F**; there is time for the cause → **Dx**.
+
+The triage has a ceiling — three questions and at most one file read. Past that it *is* Dx, and you announce it. (Written from a real one: "a coach created a training series and there's no link to it." If the series has no address in the model, a hotfix repairs the symptom where a feature was needed.)
+
 | Lane | Trigger | Process | Route |
 |---|---|---|---|
 | **— no lane** | "explain X / what does this do" | none — just answer | — |
+| **triage** | a complaint about behaviour | three questions → B, C, F or Dx | — |
 | **A · trivial** | rename, config value, copy tweak | do it + a test | no specialist, no spec |
-| **B · small fix** | you know *what* to change (wonky modal, missing field) | specialist + light gate (a test, or `/verify` for pure-visual) + commit | disambiguated specialist |
+| **B · small fix** | you know *what* to change (wonky modal, missing field) | specialist + light gate — a test, or for UI a look at the render — + commit | disambiguated specialist |
 | **C · real feature** | ambiguous, or touches money/auth/personal-data/public-contract/schema, or >half-day, or multi-session | full openspec cycle, living spec updated | openspec + `apply` disciplines |
-| **C-bootstrap** | new project / "global projection" | brainstorm + decomposition → seed baseline `openspec/specs` | then features flow as C |
-| **Dx · diagnose** | "X is broken — why?" (don't yet know the fix) | reproduce → root-cause **first** | `systematic-debugging`, then A/B/C |
-| **F · incident** | "prod is on fire, fix now" | minimal ceremony; retro-spec **after** | fast-path; bypasses C's full cycle |
 | **Ops** | deploy, migrate, restart, broadcast, rotate key | dry-run/preview, migration-ID check, backup, verify, known rollback | not a code-authoring lane |
-| **Docs** | "document X / sync docs to code" | docs = source of truth | `documentation-expert` |
-| **Spike** | "can we even do X? try it" | throwaway build-to-learn, no gate, no commit → **verdict** | re-enter as C, or discard |
-| **D · consult** | "is this file too big / is this design ok?" | verdict only, changes nothing | `system-architect` or `simplify` → A/B/C |
-| **E · audit** | "we've built a while — audit everything" | multi-dimension review → ranked findings | each finding → A/B/C |
+
+Those are the frequent shapes. The rest — **C-bootstrap**, **C-drain**, **D · consult**, **E · audit**, **Spike**, **Orient** — live in a second tier, because a rare branch in the main table costs attention on *every* classification. **Docs is no longer a lane at all**: "docs = source of truth" contradicted the one thing the whole system rests on, that the source of truth is `openspec/specs`. Pointed docs are a B; "sync the docs to the code" is C-drain.
 
 The two normal "tracks" are **Change** (A/B/C — you're modifying the system) and **Health** (D/E — you're evaluating it). Everything else is a specialized intent that eventually feeds back into a Change lane.
 
