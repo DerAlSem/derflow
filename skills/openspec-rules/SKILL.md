@@ -93,79 +93,33 @@ hard tripwire: if any task is `- [ ]`, stop. `--yes` skips the interactive
 prompt but does not invalidate the status check; never use `--yes` to push
 past an incomplete change.
 
-## How to AUTHOR an artifact
+## Формат артефактов — НЕ здесь (v4.0)
 
-### `proposal.md`
+**Источник правды по формату — схема инструмента**, а не этот файл:
+`openspec/schemas/<name>/schema.yaml` плюс `templates/`. Схема задаёт набор
+артефактов, их зависимости, инструкции и шаблоны; `openspec instructions`
+отдаёт их агенту.
 
-```md
-# <Title — verb in present tense, what changes>
+Раньше здесь лежал собственный образец формата с требованиями вида
+`### SHALL-001:` и Given/when. **Он был неверен и приводил к тихому отказу.**
+Канон — `### Requirement: <имя>` плюс `#### Scenario: <имя>` с WHEN/THEN, и
+сценарий обязан иметь **ровно четыре решётки**: с тремя он не распознаётся,
+требование остаётся без сценариев, а валидатор требует минимум один. В
+проверенном проекте `SHALL-NNN` не встречался ни разу — формат существовал
+только в этом файле.
 
-## Why
-<1-3 sentences. The pain, the trigger, the cost of NOT doing it. No
-implementation detail — describe the problem, not the solution.>
+Три правила формата, которые стоит помнить, потому что их нарушение теряет
+данные молча:
 
-## What changes
-- <bullet: behavior — what the system WILL do, observable from outside>
-- <bullet: another change>
-- Non-goals: <explicit "we are NOT doing X">
-
-## Impact
-- `openspec/specs/<capability>/spec.md`: <ADDED|CHANGED|REMOVED> requirements
-```
-
-### `design.md` (only for non-trivial changes)
-
-Only when the proposal's *what* hides a non-obvious *how*. Skippable for
-small bug fixes where the implementation is in `tasks.md`.
-
-```md
-# Design — <change title>
-
-## Context
-<inputs to this decision; what we know>
-
-## Options
-| Option | Pros | Cons |
-|---|---|---|
-
-## Decision
-<the chosen option, with date-stamped rationale>
-
-## Rollout
-<migration / dual-write / feature-flag / back-compat strategy>
-```
-
-### `tasks.md`
-
-Numbered checklist; each task ≤2h of work; uses `- [ ]` to track.
-
-```md
-# Tasks — <change title>
-
-- [ ] 1. <action + file path>
-- [ ] 2. <action + file path>
-- [ ] 3. <test or verification step>
-```
-
-### `spec.md` (the living target)
-
-```md
-# <Capability name> — SHALL specification
-
-## Purpose
-<what this capability is, in user terms — not implementation>
-
-## Requirements
-
-### SHALL-001: <imperative subject + predicate>
-The system SHALL <observable behavior>.
-Given <precondition>, when <trigger>, the system SHALL <outcome>.
-
-### SHALL-002: ...
-```
-
-A SHALL is binding and code-checkable. `descriptive` requirements are placeholders
-(awaiting your promotion to `normative` after review).
+- **`## Purpose` обязателен в дельте НОВОЙ capability** (50+ символов).
+  Archive копирует его в создаваемую главную спеку; без него остаётся
+  `TBD … Update Purpose after archive`, и починить это можно **только прямой
+  правкой** `openspec/specs/<capability>/spec.md` — дельтой нельзя.
+- **`MODIFIED` содержит ПОЛНЫЙ блок требования** со всеми сценариями.
+  Частичный теряет содержимое при слиянии через CLI.
+- **Изменение без изменения поведения** — `skip_specs: true` в
+  `.openspec.yaml` заявки. Иначе `openspec validate` отвергнет нулевую
+  дельту. Не выдумывай требование ради валидации.
 
 ## When to OPEN a change vs fix directly
 
