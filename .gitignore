@@ -15,6 +15,7 @@
 !/settings.json
 !/agents/
 !/skills/
+!/schemas/
 
 # settings.local.json НЕ версионируется. По конвенции Claude Code *.local.json —
 # машинно-локальный файл. В нём копятся разрешения, привязанные к путям и
