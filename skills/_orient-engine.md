@@ -1,6 +1,6 @@
-# _orient-engine — shared core for audit-code & adopt-code
+# _orient-engine — shared core for audit-code
 
-**Not a skill.** A reference read by `audit-code` and `adopt-code` at start.
+**Not a skill.** A reference read by `audit-code` at start.
 Do not invoke directly. Holds the model, the node schema, and the invariants
 both obey so their output is consistent and trustworthy. **`explore-code` does
 NOT read this** — orientation of an unknown repo is a lightweight discipline

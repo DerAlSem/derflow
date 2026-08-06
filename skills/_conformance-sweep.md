@@ -1,6 +1,6 @@
 # _conformance-sweep — shared reference
 
-**Not a skill.** A reference read by `adopt-code` and by derflow's Lane C gate.
+**Not a skill.** A reference read by derflow's Lane C gate (C-drain).
 Do not invoke directly. Guards **only `normative` SHALLs** — `descriptive`,
 `unbacked`, and `UNRESOLVED` items sit outside trust and are not enforced.
 
@@ -33,10 +33,6 @@ exists; there is nothing to diff against otherwise.
 
 ## When it runs
 
-1. **At adoption** — right after promotion in `adopt-code`. Validates that
-   promoted SHALLs are actually `backed`; a promoted SHALL that comes back
-   `contradicted` or `unbacked` surfaces the "you promoted something the code
-   doesn't do" case immediately (bug? or misread?).
 2. **Lane C gate** — a Lane C change touching an adopted seam runs a **mini-sweep**
    of the affected SHALLs *before* `archive`. Catches "your change contradicts a
    `normative` SHALL" → either update the spec deliberately, or the change is
