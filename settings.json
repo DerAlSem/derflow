@@ -14,6 +14,19 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Skill|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/openspec-critique-gate.sh",
+            "timeout": 10,
+            "statusMessage": "Гейт критик-слоя"
+          }
+        ]
+      }
     ]
   },
   "enabledPlugins": {
