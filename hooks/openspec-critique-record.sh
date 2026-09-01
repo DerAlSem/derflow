@@ -21,8 +21,13 @@ done
 specs="$changes_dir/$id/specs"
 [ -d "$specs" ] || { echo "У заявки «${id}» нет specs/ — критиковать нечего" >&2; exit 1; }
 
-cur=$(find "$specs" -type f -name '*.md' | LC_ALL=C sort | while IFS= read -r f; do
-  shasum -a 256 "$f"
+# Хеш = СОДЕРЖИМОЕ спеки плюс ОТНОСИТЕЛЬНЫЕ пути внутри specs/. Абсолютный путь
+# в расчёт не входит: заявка переезжает между ворктри, и с ним отметка
+# переставала сходиться при неизменном тексте. Расчёт обязан совпадать с
+# openspec-critique-gate.sh — это одна формула в двух файлах.
+cur=$(cd "$specs" && find . -type f -name '*.md' | LC_ALL=C sort | while IFS= read -r f; do
+  printf '%s ' "$f"
+  shasum -a 256 "$f" | cut -d' ' -f1
 done | shasum -a 256 | cut -d' ' -f1)
 
 {
