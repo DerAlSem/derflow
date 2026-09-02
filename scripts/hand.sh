@@ -35,8 +35,9 @@ else
   fi
   # 2. по ветке — уникальна, пока соблюдается «ветка на проблему»
   if [ -z "$hand" ] && [ -n "$br" ]; then
-    c="$dir/.claude/handoff/${br//\//-}.md"
-    [ -f "$c" ] && hand="$c"
+    for c in "$dir/.claude/handoff/${br//\//-}.md" "$dir/handoff/${br//\//-}.md"; do
+      [ -f "$c" ] && { hand="$c"; break; }
+    done
   fi
   # 3. корень — совместимость со старой конвенцией, столкновению открыт
   if [ -z "$hand" ]; then
