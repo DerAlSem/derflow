@@ -6,7 +6,8 @@
 #
 #   hand.sh                      # хендофф ищется в текущем каталоге
 #   hand.sh <каталог>            # ищется там
-#   hand.sh <каталог> <файл>     # явный путь
+#   hand.sh <каталог> <файл>     # явный путь — ОБЯЗАТЕЛЕН там, где все сессии
+#                                # сидят на одной ветке: ключ по ветке там общий
 #   hand.sh -n ...               # только показать команду, не открывать окно
 #
 # Каталог тот же? Терминал не нужен вовсе — `/clear` в текущей сессии и та же
@@ -59,10 +60,20 @@ else
       echo "ℹ️  заявочных HANDOFF.md: $nopen, ни один не объявил ветку «${br}» — ищу дальше" >&2
     fi
   fi
-  # 2. по ветке — уникальна, пока соблюдается «ветка на проблему»
+  # 2. по ветке — уникальна, ПОКА соблюдается «ветка на проблему». На стволе
+  #    (main/master/develop) она не соблюдается по определению: там сидят все
+  #    сессии сразу, и имя вырождается в общее на весь репозиторий.
   if [ -z "$hand" ] && [ -n "$br" ]; then
     for c in "$dir/.claude/handoff/${br//\//-}.md" "$dir/handoff/${br//\//-}.md"; do
-      [ -f "$c" ] && { hand="$c"; break; }
+      [ -f "$c" ] && { hand="$c"
+        case "$br" in
+          main|master|develop|trunk)
+            echo "⚠️  хендофф подобран по СТВОЛОВОЙ ветке «${br}» — это имя общее" >&2
+            echo "    на весь репозиторий, а не на задачу: на стволе сидят все" >&2
+            echo "    сессии разом. Передай свой файл вторым аргументом:" >&2
+            echo "    hand.sh <каталог> handoff/<слаг-задачи>.md" >&2 ;;
+        esac
+        break; }
     done
   fi
   # 3. корень — совместимость со старой конвенцией, столкновению открыт
@@ -118,10 +129,22 @@ echo "промпт:  $prompt"
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 q_dir="$(sq "$dir")"
 q_prompt="$(sq "$prompt")"
+
+# 🔴 `open -na` передаёт окружение ВЫЗЫВАЮЩЕГО процесса, а вызывающий — сессия
+# Claude. Свежая сессия рождалась помеченной как дочерняя к ней:
+#   CLAUDE_CODE_CHILD_SESSION=1  глушит запись транскрипта ЦЕЛИКОМ — расщеплённая
+#     сессия не оставляла следа, и любой замер по транскриптам её не видел;
+#   CLAUDE_CODE_SESSION_ID / BRIDGE_SESSION_ID  давали ей чужую личность;
+#   CLAUDE_CODE_MESSAGING_SOCKET / TOKEN  — чужой канал связи.
+# Глушим внутри порождённой оболочки, до запуска claude. EXECPATH оставляем: он
+# указывает на бинарь, а не на сессию.
+scrub='unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID'
+scrub="$scrub CLAUDE_CODE_BRIDGE_SESSION_ID CLAUDE_CODE_MESSAGING_SOCKET"
+scrub="$scrub CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_CODE_ENTRYPOINT;"
 if [ "$dry" = 1 ]; then
-  echo "команда: open -na Ghostty.app --args --working-directory=$dir -e zsh -lc \"cd $q_dir && claude ${q_prompt}\""
+  echo "команда: open -na Ghostty.app --args --working-directory=$dir -e zsh -lc \"$scrub cd $q_dir && claude ${q_prompt}\""
   exit 0
 fi
 open -na Ghostty.app --args --working-directory="$dir" -e zsh -lc \
-  "cd $q_dir && claude $q_prompt"
+  "$scrub cd $q_dir && claude $q_prompt"
 echo "окно Ghostty запрошено"
