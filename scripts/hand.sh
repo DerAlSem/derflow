@@ -8,7 +8,7 @@
 #   hand.sh <каталог>            # ищется там
 #   hand.sh <каталог> <файл>     # явный путь — ОБЯЗАТЕЛЕН там, где все сессии
 #                                # сидят на одной ветке: ключ по ветке там общий
-#   hand.sh -n ...               # только показать команду, не открывать окно
+#   hand.sh -n ...               # только показать команду, не открывать таб
 #
 # Каталог тот же? Терминал не нужен вовсе — `/clear` в текущей сессии и та же
 # константная строка.
@@ -130,21 +130,61 @@ sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 q_dir="$(sq "$dir")"
 q_prompt="$(sq "$prompt")"
 
-# 🔴 `open -na` передаёт окружение ВЫЗЫВАЮЩЕГО процесса, а вызывающий — сессия
-# Claude. Свежая сессия рождалась помеченной как дочерняя к ней:
-#   CLAUDE_CODE_CHILD_SESSION=1  глушит запись транскрипта ЦЕЛИКОМ — расщеплённая
-#     сессия не оставляла следа, и любой замер по транскриптам её не видел;
-#   CLAUDE_CODE_SESSION_ID / BRIDGE_SESSION_ID  давали ей чужую личность;
-#   CLAUDE_CODE_MESSAGING_SOCKET / TOKEN  — чужой канал связи.
-# Глушим внутри порождённой оболочки, до запуска claude. EXECPATH оставляем: он
-# указывает на бинарь, а не на сессию.
+# Транспорт — ТАБ в РАБОТАЮЩЕМ инстансе, а не новый инстанс.
+#
+# 🔴 `open -na` открывает не «новое окно», а НОВЫЙ ИНСТАНС приложения. Инстансы
+# не умеют быть табами друг друга ни при какой настройке табов, поэтому каждое
+# расщепление плодило ещё одно окно. Замер 04.09.2026: четыре живых процесса
+# Ghostty, три из них с `--working-directory=` — то есть порождённые сплитами.
+#
+# Ghostty объявляет `.sh` своим типом документа (`CFBundleDocumentTypes`,
+# «Terminal scripts») и по умолчанию открывает такой файл НОВЫМ ТАБОМ текущего
+# окна (`macos-dock-drop-behavior = new-tab`). Значит команду нельзя склеивать в
+# аргументы: её надо положить в файл и отдать ФАЙЛ работающему приложению.
+#
+# Замер там же: файл ушёл в инстанс 1454 (основной), хотя звали из 39549. То
+# есть LaunchServices несёт к главному инстансу, а не к вызывающему, — и для
+# уклада «одно окно, много табов» это верное поведение: таб появляется там, где
+# человек работает, независимо от того, из какого окна сработало расщепление.
+#
+# Побочно это чинит наследование окружения ПО ПОСТРОЕНИЮ. Прежде `open -na`
+# передавал окружение ВЫЗЫВАЮЩЕГО процесса — сессии Claude, — и свежая сессия
+# рождалась помеченной как дочерняя к ней: `CLAUDE_CODE_CHILD_SESSION=1` глушил
+# запись транскрипта ЦЕЛИКОМ. Теперь launcher запускает Ghostty, а не сессия, и
+# `CLAUDE_CODE_*` до него не доезжают вовсе (проверено: в порождённом табе они
+# пусты). Скраб ниже остаётся страховкой — на случай, если сам Ghostty однажды
+# окажется запущен из сессии, — но несущим он быть перестал.
 scrub='unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID'
 scrub="$scrub CLAUDE_CODE_BRIDGE_SESSION_ID CLAUDE_CODE_MESSAGING_SOCKET"
-scrub="$scrub CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_CODE_ENTRYPOINT;"
+scrub="$scrub CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_CODE_ENTRYPOINT"
+
+launch_dir="${TMPDIR:-/tmp}/derflow-hand"
+mkdir -p "$launch_dir"
+# Launcher не удаляет сам себя: удалять файл, который зачитывает исполняющая его
+# оболочка, — гонка. Метём по возрасту при следующем запуске.
+find "$launch_dir" -name 'hand-*.sh' -type f -mtime +1 -delete 2>/dev/null || true
+launcher="$launch_dir/hand-$$.sh"
+
+cat > "$launcher" <<LAUNCHER
+#!/bin/zsh
+$scrub
+cd $q_dir || exit 1
+if ! command -v claude >/dev/null 2>&1; then
+  echo "❌ claude не найден в PATH — сессия не стартует"
+  echo "PATH=\$PATH"
+  exec zsh -i          # держим таб открытым, иначе ошибка мигнёт и исчезнет
+fi
+exec claude $q_prompt
+LAUNCHER
+chmod +x "$launcher"
+
 if [ "$dry" = 1 ]; then
-  echo "команда: open -na Ghostty.app --args --working-directory=$dir -e zsh -lc \"$scrub cd $q_dir && claude ${q_prompt}\""
+  echo "launcher: $launcher"
+  sed 's/^/    /' "$launcher"
+  echo "команда: open -a Ghostty.app $launcher"
+  rm -f "$launcher"
   exit 0
 fi
-open -na Ghostty.app --args --working-directory="$dir" -e zsh -lc \
-  "$scrub cd $q_dir && claude $q_prompt"
-echo "окно Ghostty запрошено"
+# Без `-n`. Именно его отсутствие и делает это табом, а не новым инстансом.
+open -a Ghostty.app "$launcher"
+echo "таб Ghostty запрошен — новым табом в окне основного инстанса"
