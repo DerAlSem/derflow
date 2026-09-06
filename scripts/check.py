@@ -98,10 +98,31 @@ def build_index(repo):
     return {"idents": idents, "paths": paths, "basenames": basenames, "ncode": ncode}
 
 
+def main_worktree(repo):
+    """Ворктри памяти не имеет: слаг берётся у ОСНОВНОГО дерева репозитория.
+
+    `--show-toplevel` в ворктри отдаёт сам ворктри, и слаг ведёт в пустой
+    каталог. `--git-common-dir` — общий на все деревья: в ворктри он указывает
+    на `.git` основного, а рядом с ним и лежит то дерево. Знание проекта одно на
+    репозиторий, а не на рабочую копию.
+    """
+    try:
+        r = subprocess.run(["git", "-C", str(repo), "rev-parse",
+                            "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            common = pathlib.Path(r.stdout.strip())
+            if common.name == ".git" and common.parent.is_dir():
+                return common.parent
+    except OSError:
+        pass
+    return repo
+
+
 def memory_dir(repo, override=None):
-    """Каталог памяти привязан к слагу рабочего каталога: не-буквенно-цифровое → дефис."""
+    """Каталог памяти привязан к слагу каталога: не-буквенно-цифровое → дефис."""
     if override: return pathlib.Path(override).expanduser()
-    slug = re.sub(r"[^a-zA-Z0-9]", "-", str(repo))
+    slug = re.sub(r"[^a-zA-Z0-9]", "-", str(main_worktree(repo)))
     return pathlib.Path.home() / ".claude" / "projects" / slug / "memory"
 
 
@@ -279,7 +300,7 @@ def report(repo, idx, mem, memfiles, specfiles, findings, hyg=None):
           f"{len(idx['paths'])} путей")
     if memfiles is None:
         print(f"  ПАМЯТЬ НЕ ПРОВЕРЕНА — каталога нет или он пуст: {mem}")
-        print( "           в ворктри память по слагу пуста всегда; пусто ≠ чисто")
+        print( "           пусто ≠ чисто: у проекта может не быть памяти вовсе")
     else:
         print(f"  память   {len(memfiles)} файлов")
     print(f"  спеки    {len(specfiles)} файлов")
@@ -333,6 +354,55 @@ def run(repo, mem_override=None, quiet=False):
         return findings
     return report(repo, idx, mem, memfiles or None, specfiles, findings,
                   hygiene(mem, memfiles))
+
+
+def selftest_worktree():
+    """Укус на ворктри: слаг обязан вести в память ОСНОВНОГО дерева.
+
+    Проверка без сети и без чужих каталогов — сравниваются только пути. Наивный
+    слаг ворктри тоже вычисляется: без него зелёный ничего не доказывает, ведь
+    совпадение могло бы выйти и по построению.
+    """
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="check-wt-"))
+    ok = True
+    try:
+        repo, wt = tmp / "repo", tmp / "wt"
+        repo.mkdir()
+        env = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
+        run_git = lambda *a: subprocess.run(["git", "-C", str(repo)] + list(a),
+                                            capture_output=True, text=True)
+        subprocess.run(["git", "init", "-q", str(repo)], capture_output=True, text=True)
+        (repo / "f.txt").write_text("x\n")
+        run_git("add", "-A"); run_git(*env, "commit", "-qm", "init")
+        r = run_git("worktree", "add", "-q", str(wt), "-b", "wtbranch")
+        if not wt.is_dir():
+            print(f"✗ ворктри не создан: {r.stderr.strip()[:120]}"); return False
+
+        naive = pathlib.Path.home() / ".claude" / "projects" / \
+            re.sub(r"[^a-zA-Z0-9]", "-", str(wt)) / "memory"
+        if memory_dir(wt) == memory_dir(repo) and memory_dir(wt) != naive:
+            print("✓ ворктри: память берётся у основного дерева, не по своему слагу")
+        else:
+            print(f"✗ ворктри ведёт не туда: {memory_dir(wt)}"); ok = False
+
+        # отрицательный контроль: вне git подмены быть не должно
+        plain = tmp / "plain"; plain.mkdir()
+        if memory_dir(plain) == pathlib.Path.home() / ".claude" / "projects" / \
+                re.sub(r"[^a-zA-Z0-9]", "-", str(plain)) / "memory":
+            print("✓ не-git каталог: слаг остаётся своим")
+        else:
+            print(f"✗ не-git каталог подменён: {memory_dir(plain)}"); ok = False
+
+        # ручка сильнее механизма: явный --memory-dir не перебивается
+        if memory_dir(wt, override=str(tmp / "explicit")) == tmp / "explicit":
+            print("✓ --memory-dir перебивает механизм")
+        else:
+            print("✗ --memory-dir не сработал"); ok = False
+    finally:
+        subprocess.run(["git", "-C", str(tmp / "repo"), "worktree", "prune"],
+                       capture_output=True, text=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
 
 
 def selftest_hygiene():
@@ -454,6 +524,8 @@ def selftest():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print()
+    ok &= selftest_worktree()
+    print()
     ok &= selftest_hygiene()
     print("\nselftest:", "ЗЕЛЁНЫЙ" if ok else "КРАСНЫЙ")
     return 0 if ok else 1
@@ -463,7 +535,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("repo", nargs="?", default=".", help="корень репозитория (по умолчанию cwd)")
-    ap.add_argument("--memory-dir", help="каталог памяти, если слаг cwd ведёт не туда (ворктри)")
+    ap.add_argument("--memory-dir", help="каталог памяти, если слаг ведёт не туда")
     ap.add_argument("--selftest", action="store_true", help="укус сторожа на фикстуре")
     a = ap.parse_args()
     sys.exit(selftest() if a.selftest else (run(a.repo, a.memory_dir) and 0))
