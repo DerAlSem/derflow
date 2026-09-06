@@ -9,8 +9,22 @@
     check.py [repo]              # по умолчанию — cwd
     check.py --selftest          # укус сторожа на фикстуре
 
+Вторая половина — ГИГИЕНА: франтматтер памяти и вес индекса. Она отвечает не на
+«врёт ли память», а на «доедет ли она»: индекс всегда загружен и при
+переполнении обрезается молча.
+
+    check.py [repo]              # по умолчанию — cwd
+    check.py --selftest          # укус сторожа на фикстуре
+
 Отчёт, а не гейт: код возврата всегда 0, читает человек. Гоняется перед
 архивацией заявки и на гигиене памяти.
+
+⚠️ Гнать ТОЛЬКО на верхушке рабочей ветки. Индекс строится по дереву на диске, и
+на старом срезе живые символы читаются как отсутствующие: боевое 06.09.2026 —
+основной репозиторий стоял в detached HEAD на теге пятидневной давности, отчёт
+дал 78 находок, и проверенные из них (`job_run`, `record_package_sale`,
+`legal_entity_player`, `per_pair`) все нашлись в `main`. Отчёт выглядит
+авторитетно и врёт ровно там, где код ушёл вперёд.
 """
 
 import argparse, os, pathlib, re, subprocess, sys, tempfile, shutil, collections
@@ -91,6 +105,122 @@ def memory_dir(repo, override=None):
     return pathlib.Path.home() / ".claude" / "projects" / slug / "memory"
 
 
+# ── гигиена памяти ────────────────────────────────────────────────────────────
+# Второй вопрос, не тот же самый. Остальной чекер спрашивает «не врёт ли память»;
+# здесь — «доедет ли она вообще». Индекс всегда загружен и при переполнении
+# обрезается МОЛЧА: это потеря без предупреждения, поэтому мерить надо заранее.
+IDX_MAX_BYTES = 25 * 1024
+IDX_MAX_LINES = 200
+PTR_MAX = 120                      # знаков в строке-указателе; детали живут в теле
+LIVES = re.compile(r"^\s*живёт до:\s*(\S.*?)\s*$", re.M)
+DATE = re.compile(r"\b(\d{2})\.(\d{2})\.(\d{4})\b")
+IDXROW = re.compile(r"^\s*[-*]\s*\[[^\]]*\]\(([^)]+\.md)\)", re.M)
+
+
+def hygiene(mem, memfiles, today=None):
+    """Франтматтер и вес индекса — сводкой, а не построчно.
+
+    Построчно здесь нельзя: «нет срока» у 99 файлов из 100 даёт 99 находок, то
+    есть отчёт, который не читают. Тот же урок, что уже оплачен формой путей.
+    Поимённо печатается лишь то, на что можно ДЕЙСТВОВАТЬ: истёкший срок, сирота,
+    битый указатель, самая длинная строка.
+    """
+    import datetime
+    today = today or datetime.date.today()
+    # Сам индекс — не память: у него нет ни срока, ни строки о себе. Оставленный
+    # в наборе, он честно печатался сиротой и завышал «без срока» на единицу.
+    memfiles = [f for f in memfiles if f.name != "MEMORY.md"]
+    h = {"есть": bool(memfiles), "истёк": [], "прозой": 0, "без срока": [],
+         "сироты": [], "битые": [], "длинные": [], "самая длинная": None,
+         "байт": 0, "строк": 0}
+    if not memfiles:
+        return h
+
+    for f in memfiles:
+        try:
+            head = f.read_text(encoding="utf-8")[:2000]
+        except OSError:
+            continue
+        m = LIVES.search(head)
+        if not m:
+            h["без срока"].append(f.name)
+            continue
+        val = m.group(1)
+        d = DATE.search(val)
+        if not d:
+            h["прозой"] += 1
+            continue
+        try:
+            when = datetime.date(int(d.group(3)), int(d.group(2)), int(d.group(1)))
+        except ValueError:
+            h["прозой"] += 1
+            continue
+        if when < today:
+            h["истёк"].append((f.name, val))
+
+    idx = mem / "MEMORY.md"
+    if not idx.is_file():
+        return h
+    try:
+        text = idx.read_text(encoding="utf-8")
+    except OSError:
+        return h
+    h["байт"] = len(text.encode("utf-8"))
+    lines = text.splitlines()
+    h["строк"] = len(lines)
+    for ln in lines:
+        s = ln.strip()
+        if len(s) > PTR_MAX:
+            h["длинные"].append(s)
+    if h["длинные"]:
+        h["самая длинная"] = max(h["длинные"], key=len)
+
+    # Целостность индекса. Ручная сверка здесь уже соврала однажды: разбор
+    # 01.09.2026 отчитался «битых указателей ноль», а их было шесть. После
+    # массовой правки это проверяется механически или не проверяется вовсе.
+    named = {t.split("/")[-1] for t in IDXROW.findall(text)}
+    have = {f.name for f in memfiles}
+    h["битые"] = sorted(named - have)
+    h["сироты"] = sorted(have - named)
+    return h
+
+
+def report_hygiene(h):
+    """Печатает блок и возвращает число находок, требующих действия."""
+    print("\nГИГИЕНА ПАМЯТИ")
+    if not h["есть"]:
+        print("  — каталог памяти пуст; пусто ≠ чисто (в ворктри он пуст всегда)")
+        return 0
+
+    pct = 100 * h["байт"] // IDX_MAX_BYTES if IDX_MAX_BYTES else 0
+    flag = "  ⚠️ ПОТОЛОК" if h["байт"] > IDX_MAX_BYTES else ""
+    print(f"  индекс   {h['байт']} Б из {IDX_MAX_BYTES} ({pct}%), "
+          f"{h['строк']} строк из {IDX_MAX_LINES}{flag}")
+
+    nlong = len(h["длинные"])
+    if nlong:
+        print(f"  строки   {nlong} длиннее {PTR_MAX} знаков — "
+              f"место деталей в теле файла, не в указателе")
+        s = h["самая длинная"]
+        print(f"           самая длинная {len(s)}: {s[:70]}…")
+    else:
+        print(f"  строки   все ≤{PTR_MAX} знаков")
+
+    nno = len(h["без срока"])
+    print(f"  срок     без `живёт до:` — {nno}; прозой — {h['прозой']}; "
+          f"датой — {len(h['истёк'])} истёкших")
+    if h["прозой"]:
+        print("           прозой объявленный срок НИКТО НЕ СТОРОЖИТ — это отчёт, не гейт")
+    for name, val in h["истёк"]:
+        print(f"  ✗ {name} — срок истёк: {val}")
+    for name in h["битые"]:
+        print(f"  ✗ {name} — индекс называет файл, которого нет")
+    for name in h["сироты"]:
+        print(f"  ✗ {name} — файл есть, строки в индексе нет")
+
+    return len(h["истёк"]) + len(h["битые"]) + len(h["сироты"])
+
+
 def changes(repo):
     live, arch = set(), set()
     c = repo / "openspec" / "changes"
@@ -143,7 +273,7 @@ def scan(files, label, idx, mem_names, arch, findings):
                 findings["заявка"].append((cid, "в archive/", src))
 
 
-def report(repo, idx, mem, memfiles, specfiles, findings):
+def report(repo, idx, mem, memfiles, specfiles, findings, hyg=None):
     print(f"\ncheck · {repo.name}")
     print(f"  индекс   {idx['ncode']} файлов кода, {len(idx['idents'])} идентификаторов, "
           f"{len(idx['paths'])} путей")
@@ -172,6 +302,8 @@ def report(repo, idx, mem, memfiles, specfiles, findings):
             seen = sorted(set(srcs))
             print(f"      {', '.join(seen[:3])}" + (f" и ещё {len(seen)-3}" if len(seen) > 3 else ""))
         total += len(rows)
+    if hyg is not None:
+        total += report_hygiene(hyg)
     print(f"\nитого {total} находок\n")
     return total
 
@@ -199,7 +331,68 @@ def run(repo, mem_override=None, quiet=False):
 
     if quiet:
         return findings
-    return report(repo, idx, mem, memfiles or None, specfiles, findings)
+    return report(repo, idx, mem, memfiles or None, specfiles, findings,
+                  hygiene(mem, memfiles))
+
+
+def selftest_hygiene():
+    """Гигиена проверяется отдельно: она читает франтматтер, а не код.
+
+    Мутация здесь — дописать срок файлу, у которого его нет. Счёт обязан упасть
+    ровно на единицу; сторож, зеленеющий и до и после, не охраняет ничего.
+    """
+    import datetime
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="check-hyg-"))
+    ok = True
+    try:
+        memd = tmp / "memory"
+        memd.mkdir(parents=True)
+        (memd / "trap.md").write_text(
+            "---\nname: trap\nmetadata:\n  живёт до: бессрочно — ловушка\n---\n\nтело\n")
+        (memd / "rotten.md").write_text(
+            "---\nname: rotten\nmetadata:\n  живёт до: до выката 01.01.2020\n---\n\nтело\n")
+        (memd / "bare.md").write_text("---\nname: bare\n---\n\nтело\n")
+        (memd / "orphan.md").write_text("---\nname: orphan\n---\n\nтело\n")
+        (memd / "MEMORY.md").write_text(
+            "- [Ловушка](trap.md) — коротко\n"
+            "- [Протухла](rotten.md) — коротко\n"
+            "- [Голая](bare.md) — " + "х" * 200 + "\n"
+            "- [Призрак](gone.md) — указатель в никуда\n")
+
+        # Набор отдаётся ТАК ЖЕ, как его отдаёт run() — вместе с самим индексом.
+        # Фикстура, отфильтровавшая его заранее, зеленела, а живой прогон печатал
+        # `MEMORY.md` сиротой самому себе.
+        def files():
+            return sorted(memd.glob("*.md"))
+
+        h = hygiene(memd, files(), today=datetime.date(2026, 9, 6))
+
+        checks = [
+            ("бессрочная ловушка не объявлена истёкшей", "trap.md" not in dict(h["истёк"])),
+            ("протухшая дата поймана", ("rotten.md", "до выката 01.01.2020") in h["истёк"]),
+            ("файл без срока посчитан", h["без срока"] == ["bare.md", "orphan.md"]),
+            ("проза посчитана отдельно", h["прозой"] == 1),
+            ("битый указатель пойман", h["битые"] == ["gone.md"]),
+            ("сирота поймана", h["сироты"] == ["orphan.md"]),
+            ("длинная строка поймана", len(h["длинные"]) == 1),
+        ]
+        for label, good in checks:
+            print(("✓ " if good else "✗ ") + label)
+            ok &= good
+
+        # укус: дописываем срок — счёт «без срока» обязан упасть на единицу
+        before = len(h["без срока"])
+        (memd / "bare.md").write_text(
+            "---\nname: bare\nmetadata:\n  живёт до: пока жив X\n---\n\nтело\n")
+        after = len(hygiene(memd, files(), today=datetime.date(2026, 9, 6))["без срока"])
+        if after == before - 1:
+            print("✓ укус: дописанный срок снял ровно одну находку")
+        else:
+            print(f"✗ укус не сработал: было {before}, стало {after}")
+            ok = False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
 
 
 # ── укус сторожа ──────────────────────────────────────────────────────────────
@@ -260,6 +453,8 @@ def selftest():
                   f"символ ложно={'get_balance' in bitten}"); ok = False
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    print()
+    ok &= selftest_hygiene()
     print("\nselftest:", "ЗЕЛЁНЫЙ" if ok else "КРАСНЫЙ")
     return 0 if ok else 1
 
