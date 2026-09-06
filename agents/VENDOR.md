@@ -15,7 +15,7 @@
 | Класс | Что | Механизм |
 |---|---|---|
 | **Плагины** | `superpowers`, `marketing-skills`, `self-learning` | объявлены в `settings.json` → `enabledPlugins` + `extraKnownMarketplaces`; код в `plugins/` (не версионируется), обновление через `/plugin` |
-| **Своё** | `skills/derflow`, `dertext`, `explore-code`, `audit-code`, `adopt-code`, `_orient-engine.md`, `_conformance-sweep.md`, `agents/gap-finder.md` | живёт здесь, версионируется, источник — этот репо |
+| **Своё** | `skills/derflow`, `explore-code`, `audit-code`, `adopt-code`, `_orient-engine.md`, `_conformance-sweep.md`, `agents/gap-finder.md` | живёт здесь, версионируется, источник — этот репо |
 | **Вендоренное** | 8 агентов + `skills/make-interfaces-feel-better` | скопировано и **закреплено намеренно** (см. решение ниже), обновление ручное по рецепту |
 
 ## Решение: вендоренное остаётся вендоренным (2026-07-25)

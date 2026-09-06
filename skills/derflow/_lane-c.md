@@ -283,7 +283,7 @@ CLI вообще отвергает имена, начинающиеся с ци
 
 ## Что openspec НЕ держит
 
-**Content / marketing-heavy work? (selling site, landing, campaign)** Two layers, two homes. **openspec holds only the *system behavior/contract*** — routes, lead/ticket flows, validation, events. The **marketing layer — positioning, ICP, offer, pricing, copy, narrative — lives in its own homes** (`.agents/product-marketing.md`, offer/copy docs owned by the `marketing-skills`), **never as openspec SHALLs** (a SHALL is code-checkable; "the hero conveys 'built by practitioners'" is not). Route the marketing layer to `product-marketing` → `offers`/`pricing` → `copywriting` (+ `dertext` for native Russian); openspec captures what the site *does*, not what it *says*.
+**Content / marketing-heavy work? (selling site, landing, campaign)** Two layers, two homes. **openspec holds only the *system behavior/contract*** — routes, lead/ticket flows, validation, events. The **marketing layer — positioning, ICP, offer, pricing, copy, narrative — lives in its own homes** (`.agents/product-marketing.md`, offer/copy docs owned by the `marketing-skills`), **never as openspec SHALLs** (a SHALL is code-checkable; "the hero conveys 'built by practitioners'" is not). Route the marketing layer to `product-marketing` → `offers`/`pricing` → `copywriting` (+ `ru-text` for native Russian); openspec captures what the site *does*, not what it *says*.
 
 ## Входы в openspec
 

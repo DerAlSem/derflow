@@ -182,7 +182,7 @@ The overlaps that actually bite, resolved:
 | Root-cause a bug / unexpected behavior | `systematic-debugging` | `/code-review` |
 | Implement/optimize Python specifically | `python-pro` | frontend-developer |
 | Write/refresh docs, README, API docs | no specialist — this is writing, not design | copywriting (it sells) |
-| Make a Russian text sound native (not translationese/канцелярит) | `dertext` | copywriting (it sells) |
+| Make a Russian text sound native (not translationese/канцелярит) | `ru-text` | copywriting (it sells) |
 
 When two agents still fit, prefer the **narrower** one — and say why in the announce line.
 
