@@ -1,6 +1,9 @@
 {
   "permissions": {
-    "allow": [],
+    "allow": [
+      "Bash(/Users/deralsem/.claude/scripts/hand.sh:*)",
+      "Bash(~/.claude/scripts/hand.sh:*)"
+    ],
     "defaultMode": "auto"
   },
   "hooks": {
