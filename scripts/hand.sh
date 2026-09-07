@@ -72,13 +72,29 @@ else
   #    проверка принадлежности ниже превращала промах в ОТКАЗ вместо перебора.
   #    Поэтому кандидат обязан сам объявить текущую ветку. Не объявил никто —
   #    молча падаем на пункт 2, это и есть верное поведение.
+  #    Объявили НЕСКОЛЬКО — отказ со списком, как на ступени 2. Раньше здесь
+  #    стоял `break`, то есть побеждал алфавит: боевое 07.09.2026 в sms-gate —
+  #    давно влитая `attribute-late-delivery-reports` переезжала живую
+  #    `verify-by-inbound-code`, и преемник садился за чужую законченную работу.
+  #    Заявка на стволе живёт до архивации, так что столкновение здесь — норма,
+  #    а не редкость, и молчаливый выбор дороже отказа.
   nopen=0
   if [ -z "$hand" ] && [ -n "$br" ]; then
+    matches=""; nmatch=0
     while IFS= read -r c; do
       [ -f "$c" ] || continue
       nopen=$((nopen + 1))
-      if [ "$(declared_branch "$c")" = "$br" ]; then hand="$c"; break; fi
+      [ "$(declared_branch "$c")" = "$br" ] || continue
+      nmatch=$((nmatch + 1)); matches="${matches}${c}
+"
     done < <(find "$dir/openspec/changes" -maxdepth 2 -name HANDOFF.md 2>/dev/null | sort)
+    if [ "$nmatch" -gt 1 ]; then
+      echo "❌ ХЕНДОФФОВ НА ВЕТКУ «${br}» НЕСКОЛЬКО — который твой, скрипт не знает:" >&2
+      printf '%s' "$matches" | sed 's|^'"$dir"'/|   |' >&2
+      echo "   передай нужный вторым аргументом: hand.sh <каталог> <файл>" >&2
+      exit 6
+    fi
+    [ "$nmatch" -eq 1 ] && hand="$(printf '%s' "$matches" | head -1)"
     if [ -z "$hand" ] && [ "$nopen" -gt 0 ]; then
       echo "ℹ️  заявочных HANDOFF.md: $nopen, ни один не объявил ветку «${br}» — ищу дальше" >&2
     fi

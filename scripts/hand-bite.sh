@@ -67,6 +67,20 @@ printf 'ветка: feature/y\nимя: T·второй\n' > "$D/.claude/handoff/
 git -C "$D" add -A; git -C "$D" commit -qm h
 chk 6 "два хендоффа на одну ветку — ОТКАЗ со списком" "НЕСКОЛЬКО"
 
+# Тот же гейт на ступени ЗАЯВОК. Он там не стоял: ступень брала первое
+# совпадение и делала `break`, то есть при двух заявках на одной ветке
+# побеждал алфавит. Боевое 07.09.2026, sms-gate: `attribute-late-delivery-
+# reports` (давно влита) переезжала `verify-by-inbound-code`, и преемник
+# садился за чужую законченную работу. Ступень 2 отказывалась, ступень 1 — нет.
+D="$(mk red6os master)"
+mkdir -p "$D/openspec/changes/aaa-старая" "$D/openspec/changes/zzz-живая"
+printf 'ветка: master (влита, выкачена)\nимя: T·забытая\n' \
+  > "$D/openspec/changes/aaa-старая/HANDOFF.md"
+printf 'ветка: master\nимя: T·живая\n' \
+  > "$D/openspec/changes/zzz-живая/HANDOFF.md"
+git -C "$D" add -A; git -C "$D" commit -qm h
+chk 6 "две ЗАЯВКИ на одну ветку — ОТКАЗ, а не алфавитно первая" "НЕСКОЛЬКО"
+
 D="$(mk red3 feature/z)"
 mkdir -p "$D/.claude/handoff"
 printf 'ветка: feature/ЧУЖАЯ\nимя: T·чужой\n' > "$D/.claude/handoff/чужой.md"
