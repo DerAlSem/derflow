@@ -12,6 +12,9 @@
 #
 # Проверка самого стенда: на скрипте ДО правки 06.09.2026 он даёт 9 красных из
 # 11. Зелёный стенд, ни разу не покрасневший, ничего не доказывает.
+# То же для трёх укусов 07.09.2026 (имя в промпте, латиница в имени файла): на
+# скрипте до правки — 2 красных из 14, на промежуточном варианте с ломаным
+# шаблоном `case` — 1 красный, и это ровно тот, что ловит ложное срабатывание.
 H="${HAND:-$HOME/.claude/scripts/hand.sh}"
 ROOT="$(mktemp -d)"; trap 'rm -rf "$ROOT"' EXIT
 pass=0; fail=0
@@ -27,9 +30,26 @@ chk() {  # chk <ожидаемый rc> <ярлык> [<подстрока в вы
   out="$(bash "$H" -n "$D" ${ARG:-} 2>&1)"; rc=$?
   ok=1
   [ "$rc" = "$want" ] || ok=0
-  [ -n "$needle" ] && { printf '%s' "$out" | grep -q -- "$needle" || ok=0; }
+  # Иголка с «!» в начале означает ОБРАТНОЕ: подстроки быть НЕ должно. Без неё
+  # предупреждение, которое сработало на каждом файле подряд, стенд бы не поймал
+  # — ровно так и вышло 07.09.2026: шаблон `case` с ломаным диапазоном совпадал
+  # с «tab-name.md», а проверка «есть ли строка» это считает успехом.
+  case "$needle" in
+    '!'*) printf '%s' "$out" | grep -q -- "${needle#!}" && ok=0 ;;
+    ?*)   printf '%s' "$out" | grep -q -- "$needle" || ok=0 ;;
+  esac
   if [ "$ok" = 1 ]; then echo "  ✅ $label (rc=$rc)"; pass=$((pass+1))
-  else echo "  ❌ $label — ждали rc=$want${needle:+ и «$needle»}, получили rc=$rc"; echo "$out" | sed 's/^/       /'; fail=$((fail+1)); fi
+  else
+    # Иголку печатаем БЕЗ ведущего «!»: последовательность «« + !» съедается при
+    # выводе, и диагностика краснеющего укуса выходила как «« ,» — то есть
+    # пустой ровно там, где она и нужна (замер 07.09.2026).
+    case "$needle" in
+      '!'*) say="и НЕ должно быть «${needle#!}»" ;;
+      ?*)   say="и «$needle»" ;;
+      *)    say="" ;;
+    esac
+    echo "  ❌ $label — ждали rc=$want ${say}, получили rc=$rc"
+    echo "$out" | sed 's/^/       /'; fail=$((fail+1)); fi
   ARG=""
 }
 
@@ -107,6 +127,24 @@ mkdir -p "$D/handoff"
 printf 'ветка: main\nимя: C·единственный\n' > "$D/handoff/тема.md"
 git -C "$D" add -A; git -C "$D" commit -qm h
 chk 0 "один хендофф на стволе — проезжает" "handoff/тема.md"
+
+D="$(mk gr5 feature/tab-name)"
+mkdir -p "$D/.claude/handoff"
+printf 'ветка: feature/tab-name\nимя: C·имена сессий\n' > "$D/.claude/handoff/tab-name.md"
+git -C "$D" add -A; git -C "$D" commit -qm h
+chk 0 "промпт НЕСЁТ имя — иначе автоимя сессии одинаково у всех" "промпт:  C·имена сессий — прочитай"
+
+D="$(mk gr6 feature/tab-name2)"
+mkdir -p "$D/.claude/handoff"
+printf 'ветка: feature/tab-name2\nимя: C·латиница\n' > "$D/.claude/handoff/tab-name.md"
+git -C "$D" add -A; git -C "$D" commit -qm h
+chk 0 "ЛАТИНСКОЕ имя файла — предупреждения быть НЕ должно" '!не в латинице'
+
+D="$(mk gr7 feature/tab-name3)"
+mkdir -p "$D/.claude/handoff"
+printf 'ветка: feature/tab-name3\nимя: C·кириллица\n' > "$D/.claude/handoff/имя-файла.md"
+git -C "$D" add -A; git -C "$D" commit -qm h
+chk 0 "КИРИЛЛИЧЕСКОЕ имя файла — предупреждение, но не отказ" "не в латинице"
 
 echo
 echo "итог: ✅ $pass   ❌ $fail"
