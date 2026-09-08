@@ -276,6 +276,21 @@ def cmd_check(a):
     return 0
 
 
+def _load_rows(dirs):
+    rows = []
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.json")):
+            try:
+                v = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(v, dict):
+                rows.append(v)
+    return rows
+
+
 def cmd_list(a):
     ctx = context()
     print(f"репозиторий: {ctx.repo_id}   ({ctx.common})")
@@ -287,9 +302,43 @@ def cmd_list(a):
         cfgpath, gate, ext = load_config(ctx, a.config)
         gv, _ = gate_version(ctx, ext)
         print(f"ключ gv:     {gv}   ({len(ext)} внешних входов, {len(gate)} команд)")
+        can, why = cacheable(ctx, cfgpath)
+        if not can:
+            print(f"кэш:         выключен — {why}")
     except SystemExit:
         print("ключ gv:     — (конфига нет либо он невалиден)")
-    print("вердиктов нет")
+
+    dirs = sorted(VERDICTS.glob("*")) if a.all else [VERDICTS / ctx.repo_id]
+    rows = _load_rows(dirs)
+    if not rows:
+        print("вердиктов нет")
+        return 0
+    print()
+    print(f"  {'дерево':13} {'gv':13} {'снят':20} {'хост':14} {'python':10} сессия")
+    for v in sorted(rows, key=lambda r: r.get("recorded_at", ""), reverse=True):
+        mark = "→" if v.get("tree_sha") == ctx.tree_sha else " "
+        env = v.get("env", {}) or {}
+        print(f"{mark} {v.get('tree_sha', '')[:12]:13} {v.get('gate_version', ''):13} "
+              f"{v.get('recorded_at', '')[:19]:20} {str(v.get('host', ''))[:13]:14} "
+              f"{str(env.get('python_version', ''))[:9]:10} {v.get('session', '')}")
+    return 0
+
+
+def cmd_forget(a):
+    ctx = context()
+    d = VERDICTS / ctx.repo_id
+    if a.all:
+        targets = sorted(d.glob("*.json"))
+    elif a.current:
+        targets = sorted(d.glob(f"{ctx.tree_sha}.*.json"))
+    else:
+        targets = sorted(d.glob(f"{a.tree_sha}*.json"))
+    if not targets:
+        print("нечего забывать")
+        return 0
+    for t in targets:
+        t.unlink()
+        print(f"забыт: {t.name}")
     return 0
 
 
@@ -298,10 +347,19 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     p_list = sub.add_parser("list", help="что лежит в кэше")
     p_list.add_argument("--config", help=f"путь к {CONFIG_NAME}")
+    p_list.add_argument("--all", action="store_true", help="по всем репозиториям")
     p_list.set_defaults(fn=cmd_list)
     p_check = sub.add_parser("check", help="гейт зелёный? кэш или прогон")
     p_check.add_argument("--config", help=f"путь к {CONFIG_NAME}")
     p_check.set_defaults(fn=cmd_check)
+
+    p_forget = sub.add_parser("forget", help="сбросить вердикт")
+    g = p_forget.add_mutually_exclusive_group(required=True)
+    g.add_argument("--current", action="store_true", help="вердикты текущего дерева")
+    g.add_argument("--all", action="store_true", help="все вердикты этого репозитория")
+    g.add_argument("tree_sha", nargs="?", help="префикс sha дерева")
+    p_forget.set_defaults(fn=cmd_forget)
+
     a = ap.parse_args(argv)
     return a.fn(a)
 

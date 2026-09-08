@@ -322,5 +322,56 @@ if [ "$nv" = 0 ] && [ -n "$rid" ]; then
 else echo "  ❌ вердиктов записано ${nv} (rid=[${rid}]), ждали 0"; fail=$((fail+1)); fi
 
 echo
+echo "=== посмотреть и сбросить ==="
+
+# Иголка — СЕССИЯ, а не sha дерева: sha печатается строкой «дерево HEAD:» всегда,
+# и укус на нём проходил бы зелёным при полностью отсутствующей таблице.
+D="$(mk f1)"
+(cd "$D" && CLAUDE_CODE_SESSION_ID=опознавательная python3 "$M" check >/dev/null 2>&1)
+ARG="list"; chk 0 "list показывает строку записанного вердикта" "опознавательная"
+ARG="list"; chk 0 "list помечает вердикт ТЕКУЩЕГО дерева стрелкой" "→"
+
+D="$(mk f2)"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+(cd "$D" && python3 "$M" forget --current >/dev/null 2>&1)
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+cnt 2 "forget --current заставляет гнать заново"
+
+D="$(mk f3)"
+ARG="forget --current"; chk 0 "forget на пустом кэше — ответ, а не ошибка" "нечего забывать"
+
+# Голый forget без --current/--all/sha: argparse обязан отказать сам, кодом 2 по
+# СВОЕЙ причине. $D неважен — разбор аргументов падает раньше, чем memo дойдёт
+# до git; но chk всё равно делает `cd "$D"`, и каталог обязан существовать.
+ARG="forget"; chk 2 "forget без аргументов — argparse отказывает" "required"
+
+# forget --all: не «list ничего не печатает» (это истинно и на сломанном list —
+# урок задач 1–5), а прямая проверка ФАЙЛОВОЙ СИСТЕМЫ: было два файла вердикта,
+# стало ноль. На заглушке ни один check не пишет файл, rid остаётся пустым,
+# before никогда не равен 2 — мутант, оставляющий файлы на месте, здесь красен.
+D="$(mk f4)"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+echo y >> "$D/a.txt"; git -C "$D" add -A; git -C "$D" commit -qm two
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+rid="$(cd "$D" && python3 "$M" list | sed -n 's/^репозиторий: \([^ ]*\).*/\1/p')"
+before="$(ls "$MEMO_HOME/gate-verdicts/${rid}"/*.json 2>/dev/null | wc -l | tr -d ' ')"
+(cd "$D" && python3 "$M" forget --all >/dev/null 2>&1)
+after="$(ls "$MEMO_HOME/gate-verdicts/${rid}"/*.json 2>/dev/null | wc -l | tr -d ' ')"
+if [ -n "$rid" ] && [ "$before" = 2 ] && [ "$after" = 0 ]; then
+  echo "  ✅ forget --all вычищает оба вердикта на файловой системе"; pass=$((pass+1))
+else
+  echo "  ❌ forget --all: было ${before:-?}, после ${after:-?} (rid=[$rid])"; fail=$((fail+1))
+fi
+
+# forget <sha>: точечное удаление по позиционному аргументу — третья ветка
+# cmd_forget, отдельная от --current и --all. Проверка через runs.log (задача 4).
+D="$(mk f5)"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+sha="$(cd "$D" && git rev-parse HEAD^{tree})"
+(cd "$D" && python3 "$M" forget "$sha" >/dev/null 2>&1)
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+cnt 2 "forget <sha> точечно вычищает вердикт этого дерева"
+
+echo
 echo "итог: ✅ $pass   ❌ $fail"
 [ "$fail" = 0 ]
