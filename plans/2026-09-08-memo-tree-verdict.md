@@ -947,10 +947,16 @@ def verdict_path(ctx, gv):
 
 
 def read_verdict(path):
-    """Вердикт либо None. Битый файл — это отсутствие вердикта, а не авария."""
+    """Вердикт либо None. Битый файл — это отсутствие вердикта, а не авария.
+
+    `ValueError`, а не `json.JSONDecodeError`: испорченные байты дают
+    `UnicodeDecodeError` ещё на `read_text`, ДО разбора JSON, и он не подкласс
+    ни `OSError`, ни `JSONDecodeError`. Оба — подклассы `ValueError`, и ловить
+    надо его: иначе кэш, который обязан молча отсутствовать, роняет инструмент.
+    """
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
     if not isinstance(d, dict) or d.get("result") != "pass":
         return None
