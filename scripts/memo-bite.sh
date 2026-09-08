@@ -62,10 +62,19 @@ chk() {  # chk <ожидаемый rc> <ярлык> [<подстрока>|!<по
     echo "$out" | sed 's/^/       /'; fail=$((fail+1)); fi
   ARG=""
 }
-cnt() {  # cnt <ожидаемое число прогонов> <ярлык>
-  got="$(runs "$D")"
-  if [ "$got" = "$1" ]; then echo "  ✅ $2 (прогонов: $got)"; pass=$((pass+1))
-  else echo "  ❌ $2 — ждали прогонов $1, получили $got"; fail=$((fail+1)); fi
+cnt() {  # cnt <ожидаемое число прогонов> <ярлык> [<ожидаемый rc последнего chk>]
+  # 3-й параметр нужен ровно одному вызову: «0 прогонов» при отсутствии
+  # конфига тривиально истинно и на настоящем memo, и на пустой заглушке —
+  # та gate.py не запускает вообще никогда, вне зависимости от причины.
+  # Замер 08.09.2026 на заглушке: без сверки rc этот укус был зелёным впустую.
+  got="$(runs "$D")"; ok=1
+  [ "$got" = "$1" ] || ok=0
+  [ -z "${3:-}" ] || [ "$rc" = "$3" ] || ok=0
+  if [ "$ok" = 1 ]; then echo "  ✅ $2 (прогонов: $got)"; pass=$((pass+1))
+  else
+    echo "  ❌ $2 — ждали прогонов $1${3:+ и rc=$3}, получили прогонов $got, rc=${rc:-?}"
+    fail=$((fail+1))
+  fi
 }
 
 echo "=== положение в git ==="
@@ -148,6 +157,57 @@ ARG="list"; chk 0 "list БЕЗ вердиктов всё равно печата
 D="$(mk cfg8)"; rm "$D/deploy.json"; git -C "$D" rm -q --cached deploy.json
 git -C "$D" commit -qm "без конфига"
 ARG="list"; chk 0 "list без конфига — не падает, а говорит об этом" "конфига нет"
+
+echo
+echo "=== прогон ==="
+
+# Перенесено из задачи 2: этим укусам нужна команда `check`, и только теперь она
+# есть. Проверяется не код 2 сам по себе (его дал бы и argparse), а ТЕКСТ причины.
+D="$(mk cfg1)"; rm "$D/deploy.json"; git -C "$D" rm -q --cached deploy.json
+git -C "$D" commit -qm "без конфига"
+chk 2 "нет deploy.json — код 2 с названной причиной" "не знает, что гнать"
+cnt 0 "гейт при отсутствии конфига не гонялся" 2
+
+D="$(mk cfg2)"; printf 'не json вовсе\n' > "$D/deploy.json"
+git -C "$D" add -A; git -C "$D" commit -qm broken
+chk 2 "deploy.json не JSON — код 2, а не падение трейсбеком" "не JSON"
+
+D="$(mk cfg3)"; printf '{"gate_pure": []}\n' > "$D/deploy.json"
+git -C "$D" add -A; git -C "$D" commit -qm empty
+chk 2 "пустой gate_pure — код 2" "непустым списком"
+
+D="$(mk cfg4)"; printf '{"gate_pure": "python3 gate.py"}\n' > "$D/deploy.json"
+git -C "$D" add -A; git -C "$D" commit -qm str
+chk 2 "gate_pure строкой, а не списком — код 2" "непустым списком"
+
+D="$(mk cfg6)"
+printf '{"gate_pure": ["python3 gate.py"], "gate_version_external": ["%s/нет-такого"]}\n' \
+  "$ROOT" > "$D/deploy.json"
+git -C "$D" add -A; git -C "$D" commit -qm noext
+chk 2 "нечитаемый внешний вход — код 2, а не тихий ключ из ничего" "не читается"
+
+D="$(mk run1)"
+chk 0 "зелёный гейт — код 0" "гейт зелёный"
+cnt 1 "зелёный гейт гонялся ровно раз"
+
+D="$(mk run2)"; echo 1 > "$D/rc.txt"
+chk 1 "красный гейт — код 1, а НЕ 0" "гейт красный"
+
+# Тот самый feedback_pipe_swallows_pytest_rc, только структурно: без шелла
+# конвейер невозможен, поэтому код возврата некому глотать.
+D="$(mk run3)"; echo 7 > "$D/rc.txt"
+chk 1 "код возврата гейта не проглочен: rc=7 → memo rc=1" "кодом 7"
+
+D="$(mk run4)"
+printf '{"gate_pure": ["python3 gate.py", "python3 нет-такого.py"]}\n' > "$D/deploy.json"
+git -C "$D" add -A; git -C "$D" commit -qm two
+chk 1 "вторая команда падает — общий результат красный" "гейт красный"
+cnt 1 "первая команда всё же гонялась"
+
+D="$(mk run5)"
+printf '{"gate_pure": ["не-существует-такой-команды"]}\n' > "$D/deploy.json"
+git -C "$D" add -A; git -C "$D" commit -qm nocmd
+chk 1 "команды нет в PATH — код 1, а не трейсбек" "не запустилась"
 
 echo
 echo "итог: ✅ $pass   ❌ $fail"

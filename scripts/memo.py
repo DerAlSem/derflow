@@ -136,6 +136,45 @@ def config_tracked(ctx, path):
     return rc == 0
 
 
+def run_gate(ctx, gate):
+    """Гоняем команды по очереди в корне репозитория. Первый ненулевой — конец.
+
+    БЕЗ ШЕЛЛА и БЕЗ КОНВЕЙЕРА, и это не гигиена, а требование спеки, исполненное
+    структурно: `| tail` глотает код возврата pytest (feedback_pipe_swallows_pytest_rc).
+    Без shell=True конвейер невозможен в принципе. Цена: перенаправления в
+    gate_pure запрещены — команде, которой они нужны, место в скрипте в дереве.
+
+    stdout/stderr наследуются, а не перехватываются: гейт идёт минуты, и человек
+    обязан видеть его вывод по мере появления.
+    """
+    started = time.monotonic()
+    for cmd in gate:
+        argv = shlex.split(cmd)
+        if not argv:
+            die(2, f"пустая команда в gate_pure: {cmd!r}")
+        print(f"→ {cmd}", flush=True)
+        try:
+            rc = subprocess.run(argv, cwd=ctx.toplevel).returncode
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            print(f"гейт красный: «{cmd}» не запустилась — {e}")
+            return False, round(time.monotonic() - started, 1), cmd
+        if rc != 0:
+            print(f"гейт красный: «{cmd}» вышла кодом {rc}. Вердикт НЕ записан.")
+            return False, round(time.monotonic() - started, 1), cmd
+    return True, round(time.monotonic() - started, 1), None
+
+
+def cmd_check(a):
+    ctx = context()
+    cfgpath, gate, ext = load_config(ctx, a.config)
+    gv, extparts = gate_version(ctx, ext)
+    ok, took, _ = run_gate(ctx, gate)
+    if not ok:
+        return 1
+    print(f"гейт зелёный за {took} с.")
+    return 0
+
+
 def cmd_list(a):
     ctx = context()
     print(f"репозиторий: {ctx.repo_id}   ({ctx.common})")
@@ -159,6 +198,9 @@ def main(argv=None):
     p_list = sub.add_parser("list", help="что лежит в кэше")
     p_list.add_argument("--config", help=f"путь к {CONFIG_NAME}")
     p_list.set_defaults(fn=cmd_list)
+    p_check = sub.add_parser("check", help="гейт зелёный? кэш или прогон")
+    p_check.add_argument("--config", help=f"путь к {CONFIG_NAME}")
+    p_check.set_defaults(fn=cmd_check)
     a = ap.parse_args(argv)
     return a.fn(a)
 
