@@ -332,6 +332,13 @@ def cmd_forget(a):
     elif a.current:
         targets = sorted(d.glob(f"{ctx.tree_sha}.*.json"))
     else:
+        # Пустая строка проходит мимо required-группы argparse: для него она не
+        # None, то есть «аргумент подан». Глоб `*.json` тогда сносит ВСЁ — радиус
+        # `--all` без `--all`, и приезжает он из несработавшей переменной в скрипте,
+        # а не с клавиатуры. Порог 7 — длина короткого sha у git по умолчанию.
+        if len(a.tree_sha) < 7:
+            die(2, f"префикс дерева слишком короткий: {a.tree_sha!r}. "
+                   f"Нужно хотя бы 7 знаков; снести всё — это явный --all")
         targets = sorted(d.glob(f"{a.tree_sha}*.json"))
     if not targets:
         print("нечего забывать")

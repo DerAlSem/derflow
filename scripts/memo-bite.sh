@@ -372,6 +372,26 @@ sha="$(cd "$D" && git rev-parse HEAD^{tree})"
 (cd "$D" && python3 "$M" check >/dev/null 2>&1)
 cnt 2 "forget <sha> точечно вычищает вердикт этого дерева"
 
+# forget "": ревью задачи 6 нашло, что пустая строка проходит мимо required-
+# группы argparse (для него это не None — «аргумент подан») и глоб `*.json`
+# совпадает со всем: радиус --all без --all. Проверяем ОБЕ половины — код
+# возврата сам по себе не доказывает, что файлы целы. Иголка — текст отказа.
+D="$(mk f6)"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+echo y >> "$D/a.txt"; git -C "$D" add -A; git -C "$D" commit -qm two
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+rid="$(cd "$D" && python3 "$M" list | sed -n 's/^репозиторий: \([^ ]*\).*/\1/p')"
+before="$(ls "$MEMO_HOME/gate-verdicts/${rid}"/*.json 2>/dev/null | wc -l | tr -d ' ')"
+out="$(cd "$D" && python3 "$M" forget "" 2>&1)"; rc=$?
+after="$(ls "$MEMO_HOME/gate-verdicts/${rid}"/*.json 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q "слишком короткий" \
+    && [ "$before" = 2 ] && [ "$after" = 2 ]; then
+  echo "  ✅ forget \"\" отказывает кодом 2 и не удаляет ни одного вердикта"; pass=$((pass+1))
+else
+  echo "  ❌ forget \"\": rc=$rc (ждали 2), вердиктов до=${before:-?} после=${after:-?} (ждали 2 и 2)"
+  echo "$out" | sed 's/^/       /'; fail=$((fail+1))
+fi
+
 echo
 echo "итог: ✅ $pass   ❌ $fail"
 [ "$fail" = 0 ]
