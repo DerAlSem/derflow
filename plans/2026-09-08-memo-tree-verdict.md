@@ -1134,9 +1134,11 @@ git push
 echo
 echo "=== посмотреть и сбросить ==="
 
+# Иголка — СЕССИЯ, а не sha дерева: sha печатается строкой «дерево HEAD:» всегда,
+# и укус на нём проходил бы зелёным при полностью отсутствующей таблице.
 D="$(mk f1)"
-(cd "$D" && python3 "$M" check >/dev/null 2>&1)
-ARG="list"; chk 0 "list показывает записанный вердикт" "$(git -C "$D" rev-parse HEAD^{tree} | cut -c1-12)"
+(cd "$D" && CLAUDE_CODE_SESSION_ID=опознавательная python3 "$M" check >/dev/null 2>&1)
+ARG="list"; chk 0 "list показывает строку записанного вердикта" "опознавательная"
 ARG="list"; chk 0 "list помечает вердикт ТЕКУЩЕГО дерева стрелкой" "→"
 
 D="$(mk f2)"
@@ -1338,10 +1340,13 @@ cp ~/.claude/scripts/memo.py /tmp/memo-broken-3.py
 на
 ```python
     ok, took, _ = run_gate(ctx, gate)
+    # СЛОМАНО НАРОЧНО: вердикт пишется и на красном гейте (нарушение инварианта 7)
 ```
 
-(то есть записывать вердикт и на красном гейте; `return 1` перенести в самый конец
-за печатью). Затем:
+и в самом конце `cmd_check` заменить `return 0` на `return 0 if ok else 1`, а в
+словаре вердикта — `"result": "pass"` на `"result": "pass" if ok else "fail"`.
+Код возврата при этом остаётся честным: ломается ровно запись, а не отчёт.
+Затем:
 
 ```
 MEMO=/tmp/memo-broken-3.py bash ~/.claude/scripts/memo-bite.sh
