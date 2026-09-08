@@ -164,14 +164,82 @@ def run_gate(ctx, gate):
     return True, round(time.monotonic() - started, 1), None
 
 
+def session_id():
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or f"pid:{os.getpid()}"
+
+
+def env_fingerprint():
+    """ДИАГНОСТИКА, а не ключ (решение Р5 плана).
+
+    Вердикт по дереву переживает `pip install`. Отпечаток венва в ключе обесценивал
+    бы кэш при установке любого постороннего инструмента, а ловил бы только редкий
+    сценарий «пакет снесли, дерево не менялось». Устаревший венв ломается в
+    безопасную сторону: гейт краснеет, красное не кэшируется. Поэтому отпечаток
+    ЗАПИСЫВАЕТСЯ и показывается человеком в `memo list`, но решений по нему не
+    принимается.
+    """
+    return {"python": sys.executable,
+            "python_version": ".".join(str(x) for x in sys.version_info[:3])}
+
+
+def verdict_path(ctx, gv):
+    return VERDICTS / ctx.repo_id / f"{ctx.tree_sha}.{gv}.json"
+
+
+def read_verdict(path):
+    """Вердикт либо None. Битый файл — это отсутствие вердикта, а не авария."""
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(d, dict) or d.get("result") != "pass":
+        return None
+    return d
+
+
+def write_verdict(path, payload):
+    """tmp + os.replace: файл вердикта либо целый, либо его нет.
+
+    Имена файлов уникальны и писатель у каждого один, поэтому параллельность
+    ~/.claude (4–6 сессий разом) им не вредит.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f"{path.name}.tmp-{os.getpid()}"
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def cmd_check(a):
     ctx = context()
     cfgpath, gate, ext = load_config(ctx, a.config)
     gv, extparts = gate_version(ctx, ext)
+    vp = verdict_path(ctx, gv)
+
+    v = read_verdict(vp)
+    if v:
+        print(f"гейт пройден: дерево {ctx.tree_sha[:12]} · gv {gv} · "
+              f"{v.get('recorded_at', '?')} · сессия {v.get('session', '?')}")
+        return 0
+
     ok, took, _ = run_gate(ctx, gate)
     if not ok:
         return 1
-    print(f"гейт зелёный за {took} с.")
+
+    write_verdict(vp, {
+        "tree_sha": ctx.tree_sha,
+        "gate_version": gv,
+        "repo_id": ctx.repo_id,
+        "result": "pass",
+        "recorded_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "host": socket.gethostname(),
+        "session": session_id(),
+        "worktree": str(ctx.toplevel),
+        "duration_s": took,
+        "commands": list(gate),
+        "external": extparts,
+        "env": env_fingerprint(),
+    })
+    print(f"гейт зелёный за {took} с. Вердикт записан: {vp}")
     return 0
 
 

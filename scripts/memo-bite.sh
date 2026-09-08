@@ -67,6 +67,8 @@ cnt() {  # cnt <ожидаемое число прогонов> <ярлык> [<�
   # конфига тривиально истинно и на настоящем memo, и на пустой заглушке —
   # та gate.py не запускает вообще никогда, вне зависимости от причины.
   # Замер 08.09.2026 на заглушке: без сверки rc этот укус был зелёным впустую.
+  # Правило порядка: `cnt` с 3-м параметром звать ТОЛЬКО непосредственно
+  # после `chk` — иначе `$rc` протухший, от чужого, более раннего вызова.
   got="$(runs "$D")"; ok=1
   [ "$got" = "$1" ] || ok=0
   [ -z "${3:-}" ] || [ "$rc" = "$3" ] || ok=0
@@ -208,6 +210,58 @@ D="$(mk run5)"
 printf '{"gate_pure": ["не-существует-такой-команды"]}\n' > "$D/deploy.json"
 git -C "$D" add -A; git -C "$D" commit -qm nocmd
 chk 1 "команды нет в PATH — код 1, а не трейсбек" "не запустилась"
+
+echo
+echo "=== кэш ==="
+
+# Укус 1 спеки: пишет один процесс, читает ДРУГОЙ — с другим pid и другой сессией.
+D="$(mk c1)"
+(cd "$D" && CLAUDE_CODE_SESSION_ID=aaa python3 "$M" check >/dev/null 2>&1)
+out="$(cd "$D" && CLAUDE_CODE_SESSION_ID=bbb python3 "$M" check 2>&1)"; rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "сессия aaa"; then
+  echo "  ✅ вердикт процесса A виден процессу B и назван его сессией"; pass=$((pass+1))
+else echo "  ❌ кросс-процессный вердикт не сработал (rc=$rc)"; echo "$out" | sed 's/^/       /'; fail=$((fail+1)); fi
+cnt 1 "второй процесс чистую часть НЕ гонял"
+
+# Укус 2 спеки: главный сценарий подпроекта — вердикт переезжает между ворктри.
+D="$(mk c2)"
+git -C "$D" worktree add -q "$ROOT/c2-wt" -b c2b
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+(cd "$ROOT/c2-wt" && python3 "$M" check >/dev/null 2>&1)
+cnt 1 "вердикт из ворктри A действует в ворктри B того же репозитория"
+
+# Укус 3 спеки: правка байта в дереве обесценивает вердикт.
+D="$(mk c3)"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+echo y >> "$D/a.txt"; git -C "$D" add -A; git -C "$D" commit -qm byte
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+cnt 2 "закоммиченная правка байта — вердикт не действует, гейт гнался снова"
+
+# Укус 4 спеки: внешний вход при НЕИЗМЕННОМ дереве обесценивает вердикт.
+D="$(mk c4)"
+ext="$ROOT/ext4.txt"; echo v1 > "$ext"
+printf '{"gate_pure": ["python3 gate.py"], "gate_version_external": ["%s"]}\n' "$ext" \
+  > "$D/deploy.json"
+git -C "$D" add -A; git -C "$D" commit -qm ext4
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+echo v2 > "$ext"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+cnt 2 "правка ВНЕШНЕГО входа при том же дереве — гейт гнался снова"
+
+# Укус 5 спеки: untracked-файл кэш не ломает.
+D="$(mk c5)"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+echo draft > "$D/черновик.txt"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+cnt 1 "untracked-файл кэш НЕ ломает"
+
+# Укус 6 спеки: красное не кэшируется никогда.
+D="$(mk c6)"; echo 1 > "$D/rc.txt"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+cnt 2 "красный гейт не записан — второй раз гнался заново"
+echo 0 > "$D/rc.txt"
+chk 0 "после починки тот же sha даёт зелёное" "гейт зелёный"
 
 echo
 echo "итог: ✅ $pass   ❌ $fail"
