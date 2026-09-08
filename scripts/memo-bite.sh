@@ -117,5 +117,38 @@ echo changed > "$D/a.txt"
 ARG="list"; chk 0 "правка отслеживаемого файла дерево грязнит" "грязное:     да"
 
 echo
+echo "=== конфигурация и ключ ==="
+
+# ⚠️ Здесь ТОЛЬКО те укусы, которым хватает `list`. Ошибки конфига проверяются
+# через `check`, а его ещё нет: argparse отказал бы кодом 2 по своей причине, и
+# укус проходил бы зелёным, ничего не проверив. Они заведены в задаче 3.
+
+# Ключ обязан двигаться от ВНЕШНЕГО входа и не двигаться без него.
+D="$(mk cfg5)"
+ext="$ROOT/external.txt"; echo v1 > "$ext"
+printf '{"gate_pure": ["python3 gate.py"], "gate_version_external": ["%s"]}\n' "$ext" \
+  > "$D/deploy.json"
+git -C "$D" add -A; git -C "$D" commit -qm ext
+gv1="$(cd "$D" && python3 "$M" list | grep '^ключ gv:')"
+gv1b="$(cd "$D" && python3 "$M" list | grep '^ключ gv:')"
+echo v2 > "$ext"
+gv2="$(cd "$D" && python3 "$M" list | grep '^ключ gv:')"
+if [ "$gv1" = "$gv1b" ] && [ -n "$gv1" ]; then
+  echo "  ✅ ключ УСТОЙЧИВ при неизменном внешнем входе"; pass=$((pass+1))
+else echo "  ❌ ключ прыгает сам по себе: [$gv1] против [$gv1b]"; fail=$((fail+1)); fi
+if [ "$gv1" != "$gv2" ]; then
+  echo "  ✅ правка ВНЕШНЕГО входа двигает ключ"; pass=$((pass+1))
+else echo "  ❌ внешний вход в ключ не попал: [$gv1] = [$gv2]"; fail=$((fail+1)); fi
+
+D="$(mk cfg7)"
+ARG="list"; chk 0 "list БЕЗ вердиктов всё равно печатает ключ" "ключ gv:"
+
+# list обязан пережить отсутствие конфига: смотреть кэш надо и там, где конфига
+# нет, иначе инструмент «посмотреть и сбросить» отказывает ровно там, где нужен.
+D="$(mk cfg8)"; rm "$D/deploy.json"; git -C "$D" rm -q --cached deploy.json
+git -C "$D" commit -qm "без конфига"
+ARG="list"; chk 0 "list без конфига — не падает, а говорит об этом" "конфига нет"
+
+echo
 echo "итог: ✅ $pass   ❌ $fail"
 [ "$fail" = 0 ]
