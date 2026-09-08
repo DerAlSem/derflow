@@ -14,6 +14,11 @@
 меняет tree_sha сама. Если конфиг не отслеживается — кэш выключается, потому что
 эта опора исчезает (см. `cacheable()`).
 
+Путь конфига (`--config`) в ключе тоже нет: два отслеживаемых конфига с разными
+`gate_pure` на одном дереве целятся в один и тот же файл вердикта. Опору
+«правка команд двигает tree_sha» это снимает, поэтому `read_verdict` сверяет
+записанные `commands` с тем, что собираются гнать сейчас (см. её докстринг).
+
 Кэшируется ТОЛЬКО pass. Провал — событие, а не знание о дереве: разовый
 `Permission denied` иначе заблокировал бы sha до правки байта.
 
@@ -75,7 +80,9 @@ def context(cwd=None):
     rc, tree, err = git("rev-parse", "HEAD^{tree}", cwd=cwd)
     if rc != 0:
         die(2, "в репозитории нет коммитов — дерева нет, вердикту не к чему привязаться")
-    rc, porc, _ = git("status", "--porcelain", "--untracked-files=no", cwd=cwd)
+    rc, porc, err = git("status", "--porcelain", "--untracked-files=no", cwd=cwd)
+    if rc != 0:
+        die(2, f"git status не отдал результат: {err}")
     # --untracked-files=no — то же определение грязи, что у deploy.sh:127.
     # Компромисс назван вслух: untracked-файл с кодом вердиктом не покрыт, и
     # deploy.sh его тоже не увезёт. Без флага кэш не сработал бы ни разу: в
@@ -94,7 +101,11 @@ def load_config(ctx, explicit=None):
         die(2, f"нет {path} — memo не знает, что гнать")
     try:
         cfg = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
+    except ValueError as e:
+        # ValueError, а не json.JSONDecodeError: битая кодировка (например,
+        # деплой.json сохранён cp1251-редактором) даёт UnicodeDecodeError ещё на
+        # read_text, ДО разбора JSON — он не подкласс JSONDecodeError. Оба —
+        # подклассы ValueError (см. read_verdict про то же самое).
         die(2, f"{path}: не JSON — {e}")
     except OSError as e:
         die(2, f"{path}: не читается — {e}")
@@ -161,12 +172,25 @@ def run_gate(ctx, gate):
 
     stdout/stderr наследуются, а не перехватываются: гейт идёт минуты, и человек
     обязан видеть его вывод по мере появления.
+
+    Все команды разбираются shlex ДО запуска первой: если разбор ломается на
+    ВТОРОЙ команде, первая до этого момента уже отработала бы свои минуты, а
+    гейт всё равно закончился бы трейсбеком — минуты потрачены впустую на
+    результат, который не запишется. Разбор — код 2 с именем команды, а не
+    ValueError наверх.
     """
-    started = time.monotonic()
+    parsed = []
     for cmd in gate:
-        argv = shlex.split(cmd)
+        try:
+            argv = shlex.split(cmd)
+        except ValueError as e:
+            die(2, f"gate_pure: «{cmd}» не разобралась — {e}")
         if not argv:
             die(2, f"пустая команда в gate_pure: {cmd!r}")
+        parsed.append((cmd, argv))
+
+    started = time.monotonic()
+    for cmd, argv in parsed:
         print(f"→ {cmd}", flush=True)
         try:
             rc = subprocess.run(argv, cwd=ctx.toplevel).returncode
@@ -201,13 +225,25 @@ def verdict_path(ctx, gv):
     return VERDICTS / ctx.repo_id / f"{ctx.tree_sha}.{gv}.json"
 
 
-def read_verdict(path):
+def read_verdict(path, commands):
     """Вердикт либо None. Битый файл — это отсутствие вердикта, а не авария.
 
     `ValueError`, а не `json.JSONDecodeError`: испорченные байты дают
     `UnicodeDecodeError` ещё на `read_text`, ДО разбора JSON, и он не подкласс
     ни `OSError`, ни `JSONDecodeError`. Оба — подклассы `ValueError`, и ловить
     надо его: иначе кэш, который обязан молча отсутствовать, роняет инструмент.
+
+    `commands` — список команд, которые собираются гнать СЕЙЧАС; докстринг
+    модуля обещает, что правка gate_pure сама двигает tree_sha, потому что
+    deploy.json лежит в дереве и закоммичен. Это верно ТОЛЬКО для
+    фиксированного пути конфига. Флаг `--config` эту опору снимает: путь
+    конфига в ключ (tree_sha, gate_version_external) не входит, и два
+    отслеживаемых конфига с разными gate_pure на одном дереве целятся в ОДИН
+    файл вердикта. Без сверки записанных `commands` второй вызов брал бы
+    вердикт первого и не гонял бы свой гейт вообще — ложная зелень. Ключ
+    трогать не надо: содержимое команд и так покрыто tree_sha при фиксированном
+    пути, дыра была в идентичности ФАЙЛА, а не в составе ключа, и сверка
+    `commands` закрывает её точнее, чем правка ключа.
     """
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
@@ -219,14 +255,21 @@ def read_verdict(path):
         print(f"вердикт снят на другом хосте ({d.get('host')}) — не беру: "
               f"инвариант 2, зависящее от среды не делится между машинами")
         return None
+    if d.get("commands") != list(commands):
+        print(f"вердикт записан для других команд ({d.get('commands')!r}) — "
+              f"не беру: сейчас гонятся {list(commands)!r}")
+        return None
     return d
 
 
 def write_verdict(path, payload):
     """tmp + os.replace: файл вердикта либо целый, либо его нет.
 
-    Имена файлов уникальны и писатель у каждого один, поэтому параллельность
-    ~/.claude (4–6 сессий разом) им не вредит.
+    Писателей на один файл может быть НЕСКОЛЬКО: два ворктри на одном tree_sha
+    и одном gv целятся буквально в одно имя файла двумя процессами. Безопасность
+    даёт не единственность писателя (её тут нет), а атомарность подмены —
+    os.replace делает готовый tmp видимым файлом одним системным вызовом, и
+    любой конкурент видит либо старую версию, либо новую целиком, никогда рвань.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f"{path.name}.tmp-{os.getpid()}"
@@ -242,7 +285,7 @@ def cmd_check(a):
 
     can_cache, why = cacheable(ctx, cfgpath)
     if can_cache:
-        v = read_verdict(vp)
+        v = read_verdict(vp, gate)
         if v:
             print(f"гейт пройден: дерево {ctx.tree_sha[:12]} · gv {gv} · "
                   f"{v.get('recorded_at', '?')} · сессия {v.get('session', '?')}")
@@ -258,20 +301,28 @@ def cmd_check(a):
         print(f"гейт зелёный за {took} с. Вердикт НЕ записан: {why}")
         return 0
 
-    write_verdict(vp, {
-        "tree_sha": ctx.tree_sha,
-        "gate_version": gv,
-        "repo_id": ctx.repo_id,
-        "result": "pass",
-        "recorded_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-        "host": socket.gethostname(),
-        "session": session_id(),
-        "worktree": str(ctx.toplevel),
-        "duration_s": took,
-        "commands": list(gate),
-        "external": extparts,
-        "env": env_fingerprint(),
-    })
+    try:
+        write_verdict(vp, {
+            "tree_sha": ctx.tree_sha,
+            "gate_version": gv,
+            "repo_id": ctx.repo_id,
+            "result": "pass",
+            "recorded_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "host": socket.gethostname(),
+            "session": session_id(),
+            "worktree": str(ctx.toplevel),
+            "duration_s": took,
+            "commands": list(gate),
+            "external": extparts,
+            "env": env_fingerprint(),
+        })
+    except OSError as e:
+        # Отказ ХРАНИЛИЩА (например, chmod 500 на gate-verdicts) не имеет права
+        # выглядеть красным гейтом: гейт был зелёным, просто некуда было это
+        # записать. Формулировка — та же, что уже используется для выключенного
+        # кэша чуть выше: «гейт зелёный, вердикт НЕ записан: <причина>», код 0.
+        print(f"гейт зелёный за {took} с. Вердикт НЕ записан: {e}")
+        return 0
     print(f"гейт зелёный за {took} с. Вердикт записан: {vp}")
     return 0
 
@@ -284,7 +335,11 @@ def _load_rows(dirs):
         for f in sorted(d.glob("*.json")):
             try:
                 v = json.loads(f.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, ValueError):
+                # ValueError — та же правка и по той же причине, что в load_config
+                # и read_verdict: битый кэш обязан молча отсутствовать в `list`,
+                # а не ронять инструмент трейсбеком именно тогда, когда кэш
+                # испорчен и человек пришёл его разбирать.
                 continue
             if isinstance(v, dict):
                 rows.append(v)
@@ -332,13 +387,20 @@ def cmd_forget(a):
     elif a.current:
         targets = sorted(d.glob(f"{ctx.tree_sha}.*.json"))
     else:
-        # Пустая строка проходит мимо required-группы argparse: для него она не
-        # None, то есть «аргумент подан». Глоб `*.json` тогда сносит ВСЁ — радиус
-        # `--all` без `--all`, и приезжает он из несработавшей переменной в скрипте,
-        # а не с клавиатуры. Порог 7 — длина короткого sha у git по умолчанию.
+        # Длина одна не спасает: '???????' — те же 7 знаков, что и короткий sha,
+        # но глоб `*.json` по маске `???????*.json` совпадает с ЛЮБЫМ именем —
+        # радиус `--all` без `--all`. Хуже: строка вида '../чужой-репо/' содержит
+        # "/", а pathlib.Path.glob честно проходит по "..": `d.glob('../x/*.json')`
+        # уводит за пределы каталога ЭТОГО репозитория — снос вердиктов ЧУЖОГО.
+        # Проверять надо ШЕСТНАДЦАТИРИЧНОСТЬ префикса, а не длину: sha дерева
+        # состоит только из [0-9a-f], и ни "?", ни "/", ни "." туда не попадут
+        # случайно. Порог 7 — длина короткого sha у git по умолчанию.
         if len(a.tree_sha) < 7:
             die(2, f"префикс дерева слишком короткий: {a.tree_sha!r}. "
                    f"Нужно хотя бы 7 знаков; снести всё — это явный --all")
+        if any(c not in "0123456789abcdef" for c in a.tree_sha):
+            die(2, f"префикс дерева должен быть шестнадцатеричным (0-9a-f): "
+                   f"{a.tree_sha!r}. Снести всё — это явный --all")
         targets = sorted(d.glob(f"{a.tree_sha}*.json"))
     if not targets:
         print("нечего забывать")

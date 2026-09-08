@@ -188,6 +188,36 @@ D="$(mk cfg8)"; rm "$D/deploy.json"; git -C "$D" rm -q --cached deploy.json
 git -C "$D" commit -qm "без конфига"
 ARG="list"; chk 0 "list без конфига — не падает, а говорит об этом" "конфига нет"
 
+# C1: два ОТСЛЕЖИВАЕМЫХ конфига с разными командами на одном дереве целятся в
+# ОДИН файл вердикта (путь конфига в ключе (tree_sha, gate_version_external)
+# не участвует). Мутация 08.09.2026, снявшая сверку `commands` в read_verdict:
+# второй вызов брал вердикт первого и НЕ гонял gate2.py вообще — ложная зелень.
+# Иголка — не код возврата (он зелёный в обоих случаях), а ФАКТ прогона: файл
+# runs2.log обязан появиться только после вызова с --config alt.json.
+D="$(mk c1cfg)"
+cat > "$D/gate2.py" <<GATE2
+import pathlib
+pathlib.Path("$D/runs2.log").open("a").write("run\n")
+GATE2
+printf '{"gate_pure": ["python3 gate2.py"], "gate_version_external": []}\n' \
+  > "$D/alt.json"
+git -C "$D" add -A; git -C "$D" commit -qm altcfg
+
+chk 0 "первый конфиг (deploy.json) гоняется и кэшируется" "гейт зелёный"
+cnt 1 "гейт A (deploy.json) прогнался ровно раз" 0
+
+ARG="check --config $D/alt.json"
+chk 0 "второй конфиг (alt.json, ДРУГИЕ команды) тоже отдаёт зелёное" "гейт зелёный"
+runs2="$([ -f "$D/runs2.log" ] && wc -l < "$D/runs2.log" | tr -d ' ' || echo 0)"
+runsA="$(runs "$D")"
+if [ "$runs2" = 1 ] && [ "$runsA" = 1 ]; then
+  echo "  ✅ гейт B (alt.json) РЕАЛЬНО гонялся, а не считан из вердикта гейта A"
+  pass=$((pass+1))
+else
+  echo "  ❌ ложная зелень C1: runs.log(A)=${runsA} (ждали 1), runs2.log(B)=${runs2} (ждали 1)"
+  fail=$((fail+1))
+fi
+
 echo
 echo "=== прогон ==="
 
@@ -330,6 +360,24 @@ json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False)
 PY
 chk 0 "вердикт с ЧУЖОГО хоста не берётся, факт напечатан" "на другом хосте"
 cnt 2 "чужой хост — гейт гнался заново"
+
+# m1: читающая половина инварианта 7. Мутация «убрать в read_verdict сверку
+# result != "pass"» оставляла бы стенд полностью зелёным без этого укуса —
+# ревью нашло, что кэшируется ТОЛЬКО pass, но никто не проверял, что "fail",
+# положенный в кэш руками (или битым писателем), не будет ВЗЯТ read_verdict.
+D="$(mk s2b)"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+rid="$(cd "$D" && python3 "$M" list | sed -n 's/^репозиторий: \([^ ]*\).*/\1/p')"
+vf="$(ls "$MEMO_HOME/gate-verdicts/$rid"/*.json | head -1)"
+python3 - "$vf" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p, encoding="utf-8"))
+d["result"] = "fail"
+json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False)
+PY
+chk 0 "вердикт с result=fail в кэше не берётся, гейт гонится заново" "гейт зелёный"
+cnt 2 "result=fail в файле — второй прогон состоялся, кэш не взял его"
 
 # Неотслеживаемый deploy.json: под --untracked-files=no он невидим, значит
 # подмена команд гейта прошла бы мимо и грязи, и tree_sha.
