@@ -136,6 +136,21 @@ def config_tracked(ctx, path):
     return rc == 0
 
 
+def cacheable(ctx, cfgpath):
+    """Можно ли доверять кэшу на этом дереве — и если нет, то почему словами.
+
+    Обе причины ведут к одному: то, что гоняется, не совпадает с тем, что описывает
+    ключ. Грязное дерево — HEAD^{tree} описывает НЕ рабочую копию. Неотслеживаемый
+    конфиг — команды гейта не покрыты tree_sha (решение Р3 плана), и подмена
+    команд прошла бы мимо и грязи, и ключа.
+    """
+    if ctx.dirty:
+        return False, f"дерево грязное, правлено отслеживаемых файлов: {len(ctx.dirty)}"
+    if not config_tracked(ctx, cfgpath):
+        return False, f"{cfgpath.name} не отслеживается git — команды гейта деревом не покрыты"
+    return True, None
+
+
 def run_gate(ctx, gate):
     """Гоняем команды по очереди в корне репозитория. Первый ненулевой — конец.
 
@@ -187,12 +202,22 @@ def verdict_path(ctx, gv):
 
 
 def read_verdict(path):
-    """Вердикт либо None. Битый файл — это отсутствие вердикта, а не авария."""
+    """Вердикт либо None. Битый файл — это отсутствие вердикта, а не авария.
+
+    `ValueError`, а не `json.JSONDecodeError`: испорченные байты дают
+    `UnicodeDecodeError` ещё на `read_text`, ДО разбора JSON, и он не подкласс
+    ни `OSError`, ни `JSONDecodeError`. Оба — подклассы `ValueError`, и ловить
+    надо его: иначе кэш, который обязан молча отсутствовать, роняет инструмент.
+    """
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
     if not isinstance(d, dict) or d.get("result") != "pass":
+        return None
+    if d.get("host") != socket.gethostname():
+        print(f"вердикт снят на другом хосте ({d.get('host')}) — не беру: "
+              f"инвариант 2, зависящее от среды не делится между машинами")
         return None
     return d
 
@@ -215,15 +240,23 @@ def cmd_check(a):
     gv, extparts = gate_version(ctx, ext)
     vp = verdict_path(ctx, gv)
 
-    v = read_verdict(vp)
-    if v:
-        print(f"гейт пройден: дерево {ctx.tree_sha[:12]} · gv {gv} · "
-              f"{v.get('recorded_at', '?')} · сессия {v.get('session', '?')}")
-        return 0
+    can_cache, why = cacheable(ctx, cfgpath)
+    if can_cache:
+        v = read_verdict(vp)
+        if v:
+            print(f"гейт пройден: дерево {ctx.tree_sha[:12]} · gv {gv} · "
+                  f"{v.get('recorded_at', '?')} · сессия {v.get('session', '?')}")
+            return 0
+    else:
+        print(f"кэш выключен: {why}")
 
     ok, took, _ = run_gate(ctx, gate)
     if not ok:
         return 1
+
+    if not can_cache:
+        print(f"гейт зелёный за {took} с. Вердикт НЕ записан: {why}")
+        return 0
 
     write_verdict(vp, {
         "tree_sha": ctx.tree_sha,
