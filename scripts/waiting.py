@@ -517,6 +517,90 @@ def vanished(rows):
                 pass
 
 
+def resolve(arg, rows):
+    """Голый NN принимается, ТОЛЬКО если разрешается однозначно.
+
+    Два `20260908-01` в один день — норма, а не редкость: NN атомарен внутри
+    каталога, а каталогов столько, сколько репозиториев. Угадать хуже, чем не
+    двигаться: так же отказывает hand.sh кодом 6 на нескольких хендоффах ветки.
+    """
+    hits = [r for r in rows if (r.id == arg if "/" in arg else r.name == arg)]
+    if not hits:
+        die(2, f"нет строки {arg}. Что есть — `waiting.py list --all`")
+    if len(hits) > 1:
+        cands = "\n".join(f"  {r.id}  {r.path}" for r in sorted(hits, key=lambda r: r.id))
+        die(2, f"id {arg} неоднозначен — строк с таким именем {len(hits)}:\n{cands}\n"
+               f"Назвать полный: <repo-id>/{arg}")
+    return hits[0]
+
+
+def set_fields(path, pairs):
+    """Правка франтматтера ПО КЛЮЧУ: своё меняем, чужое не трогаем.
+
+    Перезаписью целиком нельзя — у файла один писатель, человек (инвариант 7), и
+    его комментарии, порядок полей и тело обязаны пережить машинную правку. Та
+    же дисциплина, что для файлов ~/.claude вообще: read-modify-write по якорю.
+
+    Блочные скаляры не правятся никогда — ни `probe`, ни что-либо ещё
+    многострочное: подмена одной строки оставила бы осиротевший отступ.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    end = None
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                end = i
+                break
+    if end is None:
+        die(1, f"{path}: франтматтер не закрыт — машина в такой файл не пишет")
+    left = dict(pairs)
+    for i in range(1, end):
+        m = KEY.match(lines[i])
+        if m and m.group(1) in left:
+            lines[i] = f"{m.group(1)}: {left.pop(m.group(1))}"
+    for k, v in left.items():
+        lines.insert(end, f"{k}: {v}")
+        end += 1
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cmd_done(a):
+    row = resolve(a.id, scan())
+    if not a.because.strip():
+        die(1, "надгробие без причины смерти не отвечает на вопрос, ради которого "
+               "его хранят: «сработала» и «линия закрыта» — разные исходы")
+    set_fields(row.path, [
+        ("state", "done"),
+        ("closed_at", datetime.now().date().isoformat()),
+        ("closed_because", yaml_quote(a.because)),
+    ])
+    print(f"снята: {row.id} — {a.because}")
+    return 0
+
+
+def cmd_stamp(a):
+    """Пере-вывести review_by по НЫНЕШНЕМУ полю probe.
+
+    Существует ради строк, у которых проба выяснилась после заведения: `new`
+    штампует +30, а строка становится `probe: none` позже. `ack` для этого не
+    годится — он пишет acked_outcome, то есть утверждает, что строку посмотрели
+    по существу. Здесь не посмотрели, здесь переклеили срок.
+    """
+    row = resolve(a.id, scan())
+    if row.error:
+        die(1, f"{row.id}: франтматтер не разбирается ({row.error}) — "
+               f"срок машина в такой файл не пишет")
+    probe = row.fields.get("probe")
+    days = DAYS_NO_PROBE if (probe is not None and probe.value == "none") else DAYS_WITH_PROBE
+    today = datetime.now().date()
+    when = today + timedelta(days=days)
+    set_fields(row.path, [("review_by", when.isoformat()), ("stamped_at", today.isoformat())])
+    why = ("машинной пробы нет, срок — единственный датчик" if days == DAYS_NO_PROBE
+           else "проба есть, срок — подстраховка")
+    print(f"{row.id}: пересмотр {when} (+{days} — {why})")
+    return 0
+
+
 def classify(row, today, now):
     """Группа строки. Созрелость ВЫЧИСЛЯЕТСЯ (инвариант 2), не хранится.
 
@@ -703,6 +787,15 @@ def main(argv=None):
     p_list = sub.add_parser("list", help="что ждёт события снаружи")
     p_list.add_argument("--all", action="store_true", help="показать и снятые строки")
     p_list.set_defaults(fn=cmd_list)
+
+    p_done = sub.add_parser("done", help="снять строку")
+    p_done.add_argument("id", help="<repo-id>/YYYYMMDD-NN либо голый YYYYMMDD-NN")
+    p_done.add_argument("because", help="почему снята — обязательно")
+    p_done.set_defaults(fn=cmd_done)
+
+    p_stamp = sub.add_parser("stamp", help="пере-вывести срок по нынешней probe")
+    p_stamp.add_argument("id", help="<repo-id>/YYYYMMDD-NN либо голый YYYYMMDD-NN")
+    p_stamp.set_defaults(fn=cmd_stamp)
 
     a = ap.parse_args(argv)
     return a.fn(a)
