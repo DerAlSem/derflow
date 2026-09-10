@@ -464,17 +464,87 @@ GROUPS = ("созрело", "молчит", "недостижима", "ни ра
           "недооформленные", "данные протухли")
 
 
+def cache_of(row):
+    """Кэш исходов: ФАЙЛ НА СТРОКУ, писатель один.
+
+    Общий JSON на шесть сессий воспроизвёл бы в самом реестре дефект №3, ради
+    которого реестр и пишется: git конфликта не даст, правка целиком затрёт
+    чужую главу молча. После разреза по файлам замок перестал быть условием
+    корректности и стал экономией на ssh.
+
+    Форма файла — КОНТРАКТ ДЛЯ ПОСТАВКИ 2-2, здесь только читается:
+        {"outcome": "fired" | "silent" | "unreachable",
+         "since": "ISO-8601 — начало ТЕКУЩЕЙ серии этого исхода",
+         "last_run_at_ts": float,     # когда фон спрашивал в последний раз
+         "last_rc": int}              # чем кончился САМ ПРОГОН, не проба
+    `since` нужен водяному знаку 2-2 (квитанция ключуется исходом, а не датой)
+    и в 2-1 не читается — но заводится здесь, чтобы 2-2 не выдумала второй.
+    """
+    p = CACHE / row.box.repo_id / f"{row.name}.json"
+    try:
+        c = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Битый или отсутствующий кэш — не отказ реестра: строка честно
+        # становится «ни разу не опрошена». Соврать в сторону тишины тут
+        # невозможно — «не спрашивали» и есть правда о нечитаемом файле.
+        return None
+    return c if isinstance(c, dict) else None
+
+
+def vanished(rows):
+    """Пропажа из скана — событие, и печатается она ОДИН раз.
+
+    Репозиторий уехал за корни, переименован или удалён — его строки перестают
+    находиться, list печатает меньше, и никто не считает сколько. Кэш помнит
+    виденные id и потому врать не может; ведённый список репозиториев — может.
+
+    Зовётся со ВСЕМИ строками скана, включая снятые: иначе `done` выглядела бы
+    пропажей и гасила бы собственный кэш при каждом list.
+    """
+    if not CACHE.is_dir():
+        return
+    live = {(r.box.repo_id, r.name) for r in rows}
+    for d in sorted(CACHE.glob("*")):
+        if not d.is_dir():
+            continue
+        for p in sorted(d.glob("*.json")):
+            if (d.name, p.stem) in live:
+                continue
+            print(f"строка {d.name}/{p.stem} пропала из скана — кэш о ней забыт")
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
 def classify(row, today, now):
     """Группа строки. Созрелость ВЫЧИСЛЯЕТСЯ (инвариант 2), не хранится.
 
-    Поставка 2-1 знает две группы из шести: кэш исходов никто ещё не пишет,
-    поэтому всё оформленное честно попадает в «ни разу не опрошена», а не в
-    «молчит». Разница между ними и есть инвариант 3 — без неё реестр сказал бы
-    «всё ещё ждём» про то, чего не спрашивал ни разу.
+    Порядок развилок — не вкусовой:
+    форма → срок → есть ли кэш → свеж ли он → что он говорит.
+    Срок раньше кэша, потому что review_by и есть страховка на случай, когда
+    проба врёт в сторону тишины; кэш раньше исхода, потому что «не спрашивали»
+    и «спросили, пусто» — разные ответы (инвариант 3).
     """
     if row.error or row.faults:
         return "недооформленные"
-    return "ни разу не опрошена"
+    rb = day(row.fields.get("review_by"))
+    if rb is not None and rb <= today:
+        return "созрело"
+    c = cache_of(row)
+    if c is None:
+        return "ни разу не опрошена"
+    ts = c.get("last_run_at_ts")
+    if c.get("last_rc") not in (0, None) or not isinstance(ts, (int, float)) \
+            or now - ts > 3 * CACHE_TTL_S:
+        # Молчащий реестр неотличим от пустого, а пустой — нормальное
+        # состояние, поэтому тревогу не поднимет никто. Отсюда отдельная группа.
+        return "данные протухли"
+    outcome = c.get("outcome")
+    if outcome == "fired":
+        return "созрело"
+    return {"silent": "молчит", "unreachable": "недостижима"}.get(
+        outcome, "ни разу не опрошена")
 
 
 def line_of(row, group):
@@ -493,6 +563,9 @@ def line_of(row, group):
     entry = row.fields.get("entry")
     if entry is not None and entry.value != "none":
         marks.append(entry.value)
+    if state_of(row) == "done":
+        why = row.fields.get("closed_because")
+        marks.insert(0, "снята: " + (why.value if why else "причина не названа"))
     out = [head + (("   [" + " · ".join(marks) + "]") if marks else "")]
     if group == "недооформленные":
         for why in ([row.error] if row.error else row.faults):
@@ -507,7 +580,7 @@ def cmd_list(a):
     rows = scan()
     buckets = {g: [] for g in GROUPS}
     for r in rows:
-        if state_of(r) == "done":
+        if state_of(r) == "done" and not a.all:
             continue
         buckets[classify(r, today, now)].append(r)
     printed = 0
@@ -521,6 +594,7 @@ def cmd_list(a):
         printed += len(rs)
     if printed == 0:
         print("реестр пуст")
+    vanished(rows)      # со ВСЕМИ строками, включая снятые
     # Код 1 возвращается ПОСЛЕ полной печати. Упасть на первой недооформленной
     # значило бы заглушить вывод реестра для всех шести сессий; пропустить её —
     # спрятать до review_by, то есть устроить ту самую тишину.
@@ -627,6 +701,7 @@ def main(argv=None):
     p_new.set_defaults(fn=cmd_new)
 
     p_list = sub.add_parser("list", help="что ждёт события снаружи")
+    p_list.add_argument("--all", action="store_true", help="показать и снятые строки")
     p_list.set_defaults(fn=cmd_list)
 
     a = ap.parse_args(argv)

@@ -459,6 +459,107 @@ is "комментарий у ГОЛОГО скаляра снимается —
 { has "20260404-01" && nohas "поле sample пустое"; }
 is "…а в кавычках решётка часть значения: sample с неё начинается и уцелел" $?
 
+cache() {  # cache <repo-id> <имя строки> <json одной строкой>
+  mkdir -p "$WAITING_HOME/waiting-cache/$1"
+  printf '%s\n' "$3" > "$WAITING_HOME/waiting-cache/$1/$2.json"
+}
+NOW="$(date +%s)"
+OLD="$((NOW - 4 * 3600))"          # старше 3×TTL при TTL=3600
+HB="$WAITING_HOME/waiting"
+
+echo "=== исход берётся из кэша, созрелость вычисляется ==="
+
+full "$HB" 20260505-01; cache home 20260505-01 "{\"outcome\":\"fired\",\"since\":\"2026-09-10T10:00:00\",\"last_run_at_ts\":$NOW,\"last_rc\":0}"
+full "$HB" 20260505-02; cache home 20260505-02 "{\"outcome\":\"silent\",\"since\":\"2026-09-10T10:00:00\",\"last_run_at_ts\":$NOW,\"last_rc\":0}"
+full "$HB" 20260505-03; cache home 20260505-03 "{\"outcome\":\"unreachable\",\"since\":\"2026-09-10T10:00:00\",\"last_run_at_ts\":$NOW,\"last_rc\":0}"
+full "$HB" 20260505-04; cache home 20260505-04 "{\"outcome\":\"silent\",\"since\":\"2026-09-10T10:00:00\",\"last_run_at_ts\":$OLD,\"last_rc\":0}"
+full "$HB" 20260505-05; cache home 20260505-05 "{\"outcome\":\"silent\",\"since\":\"2026-09-10T10:00:00\",\"last_run_at_ts\":$NOW,\"last_rc\":4}"
+full "$HB" 20260505-06; cache home 20260505-06 "не json вовсе"
+full "$HB" 20260505-07
+wt "$WAITING_HOME" list
+{ grp 20260505-01 | grep -q "созрело"; }
+is "кэш fired → «созрело», хотя срок пересмотра не прошёл" $?
+{ grp 20260505-02 | grep -q "молчит"; }
+is "кэш silent → «молчит»: проба спросила и ответ был пуст" $?
+{ grp 20260505-03 | grep -q "недостижима"; }
+is "кэш unreachable → «недостижима», а не «молчит» (инвариант 3)" $?
+{ grp 20260505-04 | grep -q "данные протухли"; }
+is "кэш старше 3×TTL → «данные протухли», а не вчерашняя правда под видом сегодняшней" $?
+{ grp 20260505-05 | grep -q "данные протухли"; }
+is "последний прогон упал (last_rc≠0) → «данные протухли»" $?
+{ grp 20260505-06 | grep -q "ни разу не опрошена"; }
+is "битый кэш → строка не пропадает и list не падает" $?
+{ grp 20260505-07 | grep -q "ни разу не опрошена"; }
+is "кэша нет вовсе → «ни разу не опрошена», а не «молчит»" $?
+
+# Прошедший срок пересмотра созревает строку сам, без всякой пробы: он и есть
+# страховка на случай, когда проба врёт в сторону тишины.
+line "$HB" 20260505-08 <<EOF
+---
+title: "срок пересмотра прошёл вчера"
+state: waiting
+review_by: $(date -v-1d +%Y-%m-%d)
+stamped_at: $(date -v-31d +%Y-%m-%d)
+host: mprz
+cwd: ~/dev/x
+probe: |
+  journalctl -u bot
+ripe_match: "ok"
+ripe_when: "наступило"
+sample: "видел оба исхода"
+entry: "none"
+---
+Тело.
+EOF
+cache home 20260505-08 "{\"outcome\":\"silent\",\"since\":\"2026-09-10T10:00:00\",\"last_run_at_ts\":$NOW,\"last_rc\":0}"
+wt "$WAITING_HOME" list
+{ grp 20260505-08 | grep -q "созрело"; }
+is "прошедший review_by созревает строку, даже когда проба молчит" $?
+
+echo "=== чужой кэш, снятые строки, пропажа из скана ==="
+
+full "$HB" 20260505-09
+cache notmine-deadbeef 20260505-09 "{\"outcome\":\"fired\",\"since\":\"x\",\"last_run_at_ts\":$NOW,\"last_rc\":0}"
+wt "$WAITING_HOME" list
+{ grp 20260505-09 | grep -q "ни разу не опрошена"; }
+is "кэш под ЧУЖИМ repo-id к строке не приклеивается — id глобален" $?
+{ has "notmine-deadbeef/20260505-09 пропала из скана"; }
+is "…а сам он объявлен пропавшим: скан породил этот исход, скан о нём и говорит" $?
+{ [ ! -f "$WAITING_HOME/waiting-cache/notmine-deadbeef/20260505-09.json" ]; }
+is "…и забыт: печатается ОДИН раз, ведённого списка нет" $?
+wt "$WAITING_HOME" list
+{ has "20260505-01" && nohas "пропала из скана"; }
+is "второй прогон о той же пропаже молчит" $?
+
+line "$HB" 20260505-10 <<EOF
+---
+title: "снята, сработала"
+state: done
+closed_at: $TODAY
+closed_because: "платёж прошёл, адрес приёмника встал на место"
+review_by: $PLUS30
+stamped_at: $TODAY
+host: mprz
+cwd: ~/dev/x
+probe: |
+  journalctl -u bot
+ripe_match: "ok"
+ripe_when: "наступило"
+sample: "видел оба исхода"
+entry: "none"
+---
+Тело.
+EOF
+cache home 20260505-10 "{\"outcome\":\"fired\",\"since\":\"x\",\"last_run_at_ts\":$NOW,\"last_rc\":0}"
+wt "$WAITING_HOME" list
+{ has "20260505-01" && nohas "20260505-10"; }
+is "снятая строка в обычный list не печатается" $?
+{ has "20260505-01" && nohas "20260505-10 пропала"; }
+is "…и пропавшей НЕ считается: скан её видел, просто не печатал" $?
+wt "$WAITING_HOME" list --all
+{ has "20260505-10"; }; is "list --all показывает и снятые" $?
+{ has "снята"; }; is "…с пометкой, что строка снята, а не молча в общем списке" $?
+
 echo
 echo "итог: ✅ $pass   ❌ $fail"
 [ "$fail" = 0 ]
