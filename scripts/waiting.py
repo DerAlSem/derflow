@@ -146,6 +146,387 @@ def yaml_quote(s):
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):(.*)$")
+
+
+@dataclass
+class Field:
+    value: str
+    style: str      # quoted | bare | block
+
+
+def unescape(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s) and s[i + 1] in '\\"':
+            out.append(s[i + 1]); i += 2
+        else:
+            out.append(s[i]); i += 1
+    return "".join(out)
+
+
+def strip_comment(s):
+    """Комментарий снимается ТОЛЬКО у голого скаляра.
+
+    В кавычках и в блоке решётка — часть значения: `ripe_match: "#\\d+"` —
+    законная регулярка, а не строка с комментарием.
+    """
+    if s.startswith("#"):
+        return ""
+    cut = s.find(" #")
+    return (s[:cut] if cut >= 0 else s).strip()
+
+
+def parse_front(text):
+    """Разбор франтматтера СВОИМ парсером и с сохранением стиля.
+
+    Своим — потому что PyYAML в системе нет (замер 10.09.2026), а тащить
+    зависимость ради пятнадцати полей дороже шестидесяти строк.
+
+    Стиль нужен сторожу: спека требует кавычек у пяти полей, а разобранное
+    значение о кавычках уже не помнит.
+
+    Возвращает (fields, error). error — причина либо None. Непарсящийся файл
+    НИКОГДА не проглатывается: строка с ошибкой печатается наравне с целыми,
+    иначе она исчезает беззвучно — то есть врёт в сторону тишины.
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, "нет франтматтера: файл не начинается с ---"
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}, "франтматтер не закрыт вторым ---"
+    fields, i = {}, 1
+    while i < end:
+        raw = lines[i]
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            i += 1
+            continue
+        m = KEY.match(raw)
+        if not m:
+            return fields, f"строка {i + 1}: не «ключ: значение» — {raw.strip()!r}"
+        key, rest = m.group(1), m.group(2).strip()
+        if key in fields:
+            return fields, f"строка {i + 1}: ключ {key!r} повторяется — какое из двух значений верно, не решает никто"
+        if rest == "|":
+            body, i = [], i + 1
+            while i < end and (not lines[i].strip() or lines[i][:1] in " \t"):
+                body.append(lines[i])
+                i += 1
+            pad = min((len(b) - len(b.lstrip()) for b in body if b.strip()), default=0)
+            fields[key] = Field("\n".join(b[pad:] for b in body).strip("\n"), "block")
+            continue
+        if rest.startswith('"'):
+            if len(rest) < 2 or not rest.endswith('"'):
+                return fields, f"строка {i + 1}: кавычка у {key!r} не закрыта"
+            fields[key] = Field(unescape(rest[1:-1]), "quoted")
+        else:
+            fields[key] = Field(strip_comment(rest), "bare")
+        i += 1
+    return fields, None
+
+
+def day(v):
+    """Дата или None. Принимает и поле, и строку — зовут и так, и так."""
+    if v is None:
+        return None
+    s = v.value if isinstance(v, Field) else v
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def strip_data(text):
+    """Выкидывает ДАННЫЕ, оставляет код.
+
+    Наивный `";" in probe` отвергает четыре живые строки нынешней отложки: у
+    них многострочный SQL, и точка с запятой там — конец оператора, а не
+    разделитель команд. Тело heredoc и содержимое кавычек — данные; сторож
+    смотрит на то, что осталось.
+
+    Разбор шелла здесь свой и неполный, и это сказано вслух: сторож ловит
+    написанную конъюнкцию, а не выдуманную. `bash -n` тут не помог бы — он
+    отвечает на вопрос о синтаксисе, а не о числе команд.
+    """
+    kept_lines, here, quote = [], None, None
+    for raw in text.splitlines():
+        if here is not None:
+            if raw.strip() == here:
+                here = None
+            continue
+        kept, i = [], 0
+        while i < len(raw):
+            ch = raw[i]
+            if quote:
+                if ch == quote:
+                    quote = None
+                i += 1
+                continue
+            if ch in "'\"":
+                quote = ch
+                i += 1
+                continue
+            # Ограничитель ищется ДО снятия кавычек: в `<<'SQL'` они часть
+            # маркера, и снятые первыми они оставили бы голое `<<`.
+            m = HEREDOC.match(raw, i)
+            if m:
+                here = m.group(2)
+                i = m.end()
+                continue
+            kept.append(ch)
+            i += 1
+        kept_lines.append("".join(kept))
+    return kept_lines
+
+
+def conjunction(text):
+    """Причина отказа либо None. Инвариант 1: одна строка — одна проба.
+
+    Ноль конъюнкции двусмыслен: «событий нет» и «ветка кода ни разу не
+    исполнялась» из него неразличимы (замер 08.09.2026, строка 15).
+    """
+    lines = [ln for ln in strip_data(text) if ln.strip()]
+    joined = "\n".join(lines)
+    for token in ("&&", "||", ";"):
+        if token in joined:
+            return (f"проба несёт конъюнкцию «{token}» — одна строка, одна проба: "
+                    f"ноль конъюнкции не отличить от «не исполнялось ни разу»")
+    if len(lines) > 1:
+        return ("проба несёт конъюнкцию: две команды в столбик — перевод строки "
+                "разделяет их так же, как «;»")
+    return None
+
+
+ALWAYS = ("title", "state", "review_by", "stamped_at", "entry")
+WITH_PROBE = ("host", "cwd", "probe", "ripe_match", "ripe_when", "sample")
+QUOTED = ("title", "probe", "ripe_match", "ripe_when", "sample")
+
+
+def faults(fields):
+    """Чего не хватает форме. Пустой список — строка оформлена.
+
+    Отказ формой, а не предупреждением (инвариант 4): строку без образца никто
+    не отвергает — её просто заводят, и она становится обещанием вместо
+    проверки.
+    """
+    out = []
+    for k in ALWAYS:
+        if k not in fields:
+            out.append(f"нет поля {k}")
+    for k in ALWAYS + WITH_PROBE:
+        f = fields.get(k)
+        if f is not None and not f.value.strip():
+            out.append(f"поле {k} пустое — пустое поле это не «нет данных», "
+                       f"а «данные были и потерялись при разборе»")
+    st = fields.get("state")
+    if st is not None and st.value not in ("waiting", "done"):
+        out.append(f"state: {st.value!r} — состояний два, waiting и done; третьего нет")
+    for k in ("review_by", "stamped_at"):
+        f = fields.get(k)
+        if f is not None and day(f) is None:
+            out.append(f"{k}: {f.value!r} — не дата вида ГГГГ-ММ-ДД")
+    probe = fields.get("probe")
+    if probe is None:
+        out.append("нет поля probe — либо команда, либо явное none")
+    elif probe.value == "none":
+        # Событие бывает непроверяемым машинно (ответ поддержки, решение
+        # человека). Тогда строка созревает ТОЛЬКО по сроку — и остальные поля
+        # пробы обязаны быть явным none, а не забытыми.
+        for k in ("host", "cwd", "ripe_match", "sample"):
+            f = fields.get(k)
+            if f is None or f.value != "none":
+                out.append(f"probe: none, а {k} не none — спрашивать нечем, "
+                           f"и полупустая проба это скрывает")
+        if "ripe_when" not in fields:
+            out.append("нет поля ripe_when: без пробы прозой сказано только оно")
+        rb, sa = day(fields.get("review_by")), day(fields.get("stamped_at"))
+        if rb and sa and (rb - sa).days > DAYS_NO_PROBE:
+            out.append(
+                f"probe: none при штампе +{(rb - sa).days} — срок вдвое длиннее, "
+                f"чем положено единственному датчику; чинится `waiting.py stamp`")
+    else:
+        for k in WITH_PROBE:
+            if k not in fields:
+                out.append(f"нет поля {k}")
+        why = conjunction(probe.value)
+        if why:
+            out.append(why)
+        for k in ("host", "cwd"):
+            f = fields.get(k)
+            if f is not None and f.value in ("", "none"):
+                out.append(f"{k}: none при живой пробе — фоновая проба стартует "
+                           f"из неизвестного каталога и честно не найдёт путей")
+    for k in QUOTED:
+        f = fields.get(k)
+        if f is None or f.style in ("quoted", "block"):
+            continue
+        if k != "title" and f.value in ("none", "pending"):
+            continue
+        out.append(f"{k} без кавычек: двоеточие с пробелом внутри плоского "
+                   f"скаляра YAML либо ломает разбор, либо меняет смысл")
+    return out
+
+
+def roots():
+    """Корни скана. Конфиг, а не индекс.
+
+    Отсутствующий файл с работающим умолчанием честнее заведённого файла,
+    который надо вести. Файл с нулём корней — ошибка: это не «корней нет», это
+    «сказали, что есть, и не назвали».
+    """
+    if not ROOTS.is_file():
+        return [pathlib.Path.home() / "dev"]
+    out = []
+    for ln in ROOTS.read_text(encoding="utf-8").splitlines():
+        ln = ln.split("#", 1)[0].strip()
+        if ln:
+            out.append(pathlib.Path(ln).expanduser())
+    if not out:
+        die(2, f"{ROOTS} есть, но не называет ни одного корня")
+    return out
+
+
+def boxes():
+    """Каталоги-ящики. Список репозиториев НЕ ведётся — выводится глобом:
+    ведённый индекс расходится с реальностью молча, скан не может.
+
+    `~/.claude/waiting/` добавляется ОТДЕЛЬНОЙ строкой: глоб
+    <root>/*/.claude/waiting по корню ~/.claude дал бы
+    ~/.claude/*/.claude/waiting и не нашёл бы его вовсе.
+    """
+    seen, out = set(), []
+    for root in roots():
+        for d in sorted(root.glob(f"*/.claude/{BOX}")):
+            if not d.is_dir():
+                continue
+            repo = d.parent.parent
+            if worktree_main(repo) != repo.resolve():
+                continue      # ворктри: его строки живут в основном чекауте
+            r = d.resolve()
+            if r not in seen:
+                seen.add(r)
+                out.append(r)
+    h = HOME / BOX
+    if h.is_dir() and h.resolve() not in seen:
+        out.append(h.resolve())
+    return out
+
+
+@dataclass
+class Row:
+    box: Box
+    path: pathlib.Path
+    name: str
+    fields: dict
+    error: str
+    faults: list
+
+    @property
+    def id(self):
+        return f"{self.box.repo_id}/{self.name}"
+
+
+def scan():
+    rows = []
+    for d in boxes():
+        box = box_of_dir(d)
+        for p in sorted(d.glob("*.md")):
+            if p.name == "MIGRATION.md":
+                continue      # карта старых номеров поставки 2-3 — не строка
+            try:
+                text = p.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                rows.append(Row(box, p, p.stem, {}, f"не читается — {e}", []))
+                continue
+            f, err = parse_front(text)
+            rows.append(Row(box, p, p.stem, f, err, [] if err else faults(f)))
+    return rows
+
+
+def state_of(row):
+    f = row.fields.get("state")
+    return f.value if f else ""
+
+
+def sort_key(row):
+    return (day(row.fields.get("review_by")) or date.max, row.id)
+
+
+GROUPS = ("созрело", "молчит", "недостижима", "ни разу не опрошена",
+          "недооформленные", "данные протухли")
+
+
+def classify(row, today, now):
+    """Группа строки. Созрелость ВЫЧИСЛЯЕТСЯ (инвариант 2), не хранится.
+
+    Поставка 2-1 знает две группы из шести: кэш исходов никто ещё не пишет,
+    поэтому всё оформленное честно попадает в «ни разу не опрошена», а не в
+    «молчит». Разница между ними и есть инвариант 3 — без неё реестр сказал бы
+    «всё ещё ждём» про то, чего не спрашивал ни разу.
+    """
+    if row.error or row.faults:
+        return "недооформленные"
+    return "ни разу не опрошена"
+
+
+def line_of(row, group):
+    title = row.fields.get("title")
+    head = f"  {row.id}  {title.value if title else '(без title)'}"
+    marks = []
+    rb = row.fields.get("review_by")
+    if rb is not None:
+        marks.append(f"пересмотр {rb.value}")
+    probe = row.fields.get("probe")
+    if probe is not None and probe.value == "none":
+        marks.append("машинной пробы нет, созреет только сроком")
+    sample = row.fields.get("sample")
+    if sample is not None and sample.value == "pending":
+        marks.append("образца нет, отрицательный ответ ничего не доказывает")
+    entry = row.fields.get("entry")
+    if entry is not None and entry.value != "none":
+        marks.append(entry.value)
+    out = [head + (("   [" + " · ".join(marks) + "]") if marks else "")]
+    if group == "недооформленные":
+        for why in ([row.error] if row.error else row.faults):
+            out.append(f"      ⚠ {why}")
+        out.append(f"      файл: {row.path}")
+    return "\n".join(out)
+
+
+def cmd_list(a):
+    today = datetime.now().date()
+    now = time.time()
+    rows = scan()
+    buckets = {g: [] for g in GROUPS}
+    for r in rows:
+        if state_of(r) == "done":
+            continue
+        buckets[classify(r, today, now)].append(r)
+    printed = 0
+    for g in GROUPS:
+        rs = sorted(buckets[g], key=sort_key)
+        if not rs:
+            continue
+        print(f"— {g} ({len(rs)}) —")
+        for r in rs:
+            print(line_of(r, g))
+        printed += len(rs)
+    if printed == 0:
+        print("реестр пуст")
+    # Код 1 возвращается ПОСЛЕ полной печати. Упасть на первой недооформленной
+    # значило бы заглушить вывод реестра для всех шести сессий; пропустить её —
+    # спрятать до review_by, то есть устроить ту самую тишину.
+    return 1 if buckets["недооформленные"] else 0
+
+
 def display_path(p):
     """Путь репозитория для entry, сокращённый через ~ под домашним каталогом.
 
@@ -243,6 +624,9 @@ def main(argv=None):
     p_new.add_argument("--global", dest="global_box", action="store_true",
                        help="строка без проекта — в ~/.claude/waiting/")
     p_new.set_defaults(fn=cmd_new)
+
+    p_list = sub.add_parser("list", help="что ждёт события снаружи")
+    p_list.set_defaults(fn=cmd_list)
 
     a = ap.parse_args(argv)
     return a.fn(a)

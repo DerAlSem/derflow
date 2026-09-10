@@ -139,6 +139,310 @@ wt "$ROOT/plain" new "заведена вне git"
 { [ "$rc" = 0 ] && has "home/"; }
 is "new вне репозитория кладёт строку в дом, а не падает" $?
 
+line() {  # line <каталог-ящика> <имя без .md> — содержимое файла со stdin
+  mkdir -p "$1"; cat > "$1/$2.md"
+}
+full() {  # full <каталог-ящика> <имя> — заведомо ПРАВИЛЬНАЯ строка-образец
+  line "$1" "$2" <<EOF
+---
+title: "образец: все поля добыты боем"
+state: waiting
+review_by: $PLUS30
+stamped_at: $TODAY
+host: mprz
+cwd: ~/dev/rk_bot
+probe: |
+  journalctl -u bot-rk --since "2026-09-06 17:48"
+ripe_match: "приёмник (?!—)"
+ripe_when: "в строке подачи стоит АДРЕС приёмника, а не прочерк"
+sample: "06.09 19:40 у платежа 1442 стоит прочерк — греп находит строки"
+entry: "rk_bot · main"
+---
+
+Тело.
+EOF
+}
+
+echo "=== скан: где ищем и где не ищем ==="
+
+S="$(mk scan_a)"; SB="$S/.claude/waiting"
+full "$SB" 20260101-01
+wt "$S" list
+# Кода 0 тут не ждём: в ящике дома уже лежат шаблоны из главы «заведение», и они
+# честно недооформлены — list вернёт 1. Укус сверяет СОСТАВ вывода, а не код.
+{ has "20260101-01"; }; is "оформленная строка проекта находится сканом" $?
+{ has "ни разу не опрошена"; }
+is "и лежит в «ни разу не опрошена», а НЕ в «молчит» (инвариант 3)" $?
+
+# Укус 4 спеки: ~/.claude/waiting/ добавляется к результату глоба отдельной
+# строкой — сам глоб <root>/*/.claude/waiting его не находит вовсе.
+full "$WAITING_HOME/waiting" 20260101-02
+wt "$S" list
+{ has "home/20260101-02"; }
+is "строка в ~/.claude/waiting/ находится сканом наравне с проектной" $?
+
+# Ворктри под самым корнем скана: глоб его увидит, скан обязан отсеять.
+git -C "$S" worktree add -q "$ROOT/repos/scan_a_wt" -b sidewt
+full "$ROOT/repos/scan_a_wt/.claude/waiting" 20260101-09
+wt "$S" list
+{ has "20260101-01" && nohas "20260101-09"; }
+is "ящик, заведённый в ворктри, сканом не подхватывается (инвариант 6)" $?
+
+O="$ROOT/outside/far"; mkdir -p "$O"; full "$O/.claude/waiting" 20260101-08
+wt "$S" list
+{ has "20260101-01" && nohas "20260101-08"; }
+is "репозиторий вне корней сканом не виден — корни это конфиг" $?
+
+mkdir -p "$ROOT/home2"; printf '# только комментарий\n' > "$ROOT/home2/waiting-roots.txt"
+out="$(cd "$ROOT" && WAITING_HOME="$ROOT/home2" python3 "$W" list 2>&1)"; rc=$?
+{ [ "$rc" = 2 ]; }
+is "файл корней без единого корня — ошибка конфигурации, код 2, а не «корней нет»" $?
+
+mkdir -p "$ROOT/home3"
+out="$(cd "$ROOT" && WAITING_HOME="$ROOT/home3" python3 "$W" list 2>&1)"; rc=$?
+{ [ "$rc" != 2 ] && { has "реестр пуст" || has "— "; }; }
+is "отсутствие файла корней — не ошибка: работает умолчание ~/dev" $?
+
+echo "=== форма отказывает при list ==="
+
+F="$(mk form)"; FB="$F/.claude/waiting"
+
+# Укус 5 спеки — три утверждения в одном месте, и они разные.
+full "$FB" 20260202-01
+line "$FB" 20260202-02 <<EOF
+---
+title: "образца нет вовсе"
+state: waiting
+review_by: $PLUS30
+stamped_at: $TODAY
+host: mprz
+cwd: ~/dev/rk_bot
+probe: |
+  journalctl -u bot-rk
+ripe_match: "приёмник"
+ripe_when: "адрес вместо прочерка"
+entry: "rk_bot · main"
+---
+Тело.
+EOF
+wt "$F" list
+{ [ "$rc" = 1 ]; }; is "строка без sample → list возвращает 1" $?
+{ has "недооформленные"; }; is "…и печатает её в группе «недооформленные»" $?
+{ has "sample"; }; is "…называя, какого поля не хватает" $?
+{ has "20260202-01"; }
+is "…и ОСТАЛЬНЫЕ группы напечатаны полностью, а не заглушены отказом" $?
+
+# Укус 7 спеки: естественная реализация проглотила бы это try/except.
+line "$FB" 20260202-03 <<'EOF'
+---
+title: "тут двоеточие: и кавычек нет
+state: waiting
+---
+Тело.
+EOF
+wt "$F" list
+{ has "20260202-03"; }; is "непарсящийся франтматтер напечатан, а не пропущен молча" $?
+
+line "$FB" 20260202-04 <<EOF
+---
+title: "ключ повторяется"
+state: waiting
+state: done
+review_by: $PLUS30
+---
+Тело.
+EOF
+wt "$F" list
+{ has "20260202-04"; }; is "повтор ключа во франтматтере — тоже отказ, а не последний выигрывает" $?
+
+echo "=== сторож пробы: конъюнкции нет, но данные не код ==="
+
+C="$(mk conj)"; CB="$C/.claude/waiting"
+mkprobe() {  # mkprobe <имя> <<'EOF' — тело блочного скаляра probe
+  name="$1"; body="$(cat)"
+  { printf -- '---\ntitle: "проба %s"\nstate: waiting\nreview_by: %s\nstamped_at: %s\n' \
+      "$name" "$PLUS30" "$TODAY"
+    printf 'host: mprz\ncwd: ~/dev/x\nprobe: |\n'
+    printf '%s\n' "$body" | sed 's/^/  /'
+    printf 'ripe_match: "ok"\nripe_when: "наступило"\nsample: "видел оба исхода"\n'
+    printf -- 'entry: "conj · main"\n---\nТело.\n'
+  } > "$CB/$name.md"
+}
+mkdir -p "$CB"
+mkprobe 20260303-01 <<'EOF'
+cd /srv && journalctl -u bot
+EOF
+mkprobe 20260303-02 <<'EOF'
+psql -f a.sql; psql -f b.sql
+EOF
+mkprobe 20260303-03 <<'EOF'
+./scripts/prod_sql.sh <<'SQL'
+select id, state
+  from orders
+ where state = 'new';
+SQL
+EOF
+mkprobe 20260303-04 <<'EOF'
+.venv/bin/python -c 'import x; print(x.n)'
+EOF
+mkprobe 20260303-05 <<'EOF'
+journalctl -u bot
+grep -c ошибка /var/log/app.log
+EOF
+mkprobe 20260303-06 <<'EOF'
+journalctl -u bot 2>&1 | tail -50
+EOF
+wt "$C" list
+{ has "20260303-01"; }; is "конъюнкция через && поймана" $?
+{ has "20260303-02"; }; is "конъюнкция через ; поймана" $?
+{ has "20260303-01" && nohas "20260303-03"; }
+is "многострочный SQL в heredoc с ; внутри — НЕ конъюнкция: тело heredoc это данные" $?
+{ has "20260303-02" && nohas "20260303-04"; }
+is "; внутри кавычек — не конъюнкция, а часть аргумента" $?
+{ has "20260303-05"; }
+is "две команды в столбик — конъюнкция: перевод строки разделяет так же, как ;" $?
+{ has "20260303-05" && nohas "20260303-06"; }
+is "конвейер и 2>&1 конъюнкцией не считаются" $?
+
+echo "=== кавычки, none и pending ==="
+
+Q="$(mk quotes)"; QB="$Q/.claude/waiting"
+line "$QB" 20260404-01 <<EOF
+---
+title: заголовок без кавычек
+state: waiting
+review_by: $PLUS30
+stamped_at: $TODAY
+host: mprz
+cwd: ~/dev/x
+probe: |
+  journalctl -u bot
+ripe_match: "ok"
+ripe_when: "наступило"
+sample: "видел оба исхода"
+entry: "quotes · main"
+---
+Тело.
+EOF
+line "$QB" 20260404-02 <<EOF
+---
+title: "sample: pending — законный третий вид"
+state: waiting
+review_by: $PLUS30
+stamped_at: $TODAY
+host: mprz
+cwd: ~/dev/x
+probe: |
+  grep -c ключ /etc/app.conf
+ripe_match: "^[1-9]"
+ripe_when: "ключ в конфиге появился"
+sample: pending
+entry: "quotes · main"
+---
+Файла с ключом никогда не существовало — образца нет и быть не может.
+EOF
+line "$QB" 20260404-03 <<EOF
+---
+title: "машинной пробы нет, срок +7"
+state: waiting
+review_by: $PLUS7
+stamped_at: $TODAY
+host: none
+cwd: none
+probe: none
+ripe_match: none
+ripe_when: "поддержка ответила по тикету 4417"
+sample: none
+entry: none
+---
+Ответ человека машинно не проверяется.
+EOF
+line "$QB" 20260404-04 <<EOF
+---
+title: "probe: none при штампе +30"
+state: waiting
+review_by: $PLUS30
+stamped_at: $TODAY
+host: none
+cwd: none
+probe: none
+ripe_match: none
+ripe_when: "решение владельца по derflow"
+sample: none
+entry: none
+---
+Штамп и проба разошлись.
+EOF
+line "$QB" 20260404-05 <<EOF
+---
+title: "проба есть, а штамп короткий — это НЕ расхождение"
+state: waiting
+review_by: $PLUS7
+stamped_at: $TODAY
+host: mprz
+cwd: ~/dev/x
+probe: |
+  journalctl -u bot
+ripe_match: "#\\d+ готов"
+ripe_when: "наряд закрыт"
+sample: "видел оба исхода"
+entry: "quotes · main"
+---
+Короткий срок безвреден: он даёт лишний взгляд, а не пропуск.
+EOF
+line "$QB" 20260404-06 <<EOF
+---
+title: "состояния третьего не бывает"
+state: отложено
+review_by: $PLUS7
+stamped_at: $TODAY
+host: none
+cwd: none
+probe: none
+ripe_match: none
+ripe_when: "что-нибудь"
+sample: none
+entry: none
+---
+Тело.
+EOF
+line "$QB" 20260404-07 <<EOF
+---
+title: "комментарий у голого скаляра — форма из самой спеки"
+state: waiting            # waiting | done — третьего нет
+review_by: $PLUS30        # машиной: +30, потому что проба есть
+stamped_at: $TODAY
+host: mprz                # local | mprz | …
+cwd: ~/dev/x
+probe: |
+  journalctl -u bot
+ripe_match: "ok"
+ripe_when: "наступило"
+sample: "# 06.09 у платежа 1442 прочерк — греп показал оба исхода"
+entry: "quotes · main"
+---
+Тело.
+EOF
+wt "$Q" list
+{ has "20260404-01"; }; is "title без кавычек — недооформленная строка" $?
+{ has "20260404-01" && nohas "20260404-02"; }
+is "sample: pending — законный третий вид, не порок" $?
+{ has "образца нет, отрицательный ответ ничего не доказывает"; }
+is "…и list печатает про неё именно это, а не молчит" $?
+{ has "20260404-01" && nohas "20260404-03"; }
+is "probe: none при штампе +7 — законная строка" $?
+{ has "машинной пробы нет, созреет только сроком"; }
+is "…и list называет это явно, иначе она тихо не сработает никогда" $?
+{ has "20260404-04"; }; is "probe: none при штампе +30 — расхождение, которое обязано быть видным" $?
+{ has "stamp"; }; is "…и list называет команду, которой это чинится" $?
+{ has "20260404-06" && nohas "20260404-05"; }
+is "проба при штампе +7 расхождением НЕ считается — короткий срок безвреден" $?
+{ has "20260404-06"; }; is "state: третьего значения — недооформленная строка" $?
+{ has "20260404-01" && nohas "20260404-07"; }
+is "комментарий у ГОЛОГО скаляра снимается — иначе review_by перестаёт быть датой" $?
+{ has "20260404-01" && nohas "поле sample пустое"; }
+is "…а в кавычках решётка часть значения: sample с неё начинается и уцелел" $?
+
 echo
 echo "итог: ✅ $pass   ❌ $fail"
 [ "$fail" = 0 ]
