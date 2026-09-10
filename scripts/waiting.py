@@ -146,6 +146,21 @@ def yaml_quote(s):
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def display_path(p):
+    """Путь репозитория для entry, сокращённый через ~ под домашним каталогом.
+
+    Голое имя репозиторий не локализует: корней скана может быть несколько, и
+    одноимённые каталоги под разными корнями — тот самый класс, ради которого
+    идентификатор сделан глобальным. Спека приводит единственный конкретный
+    образец entry — с путём: `~/dev/rk_bot · main`.
+    """
+    p = pathlib.Path(p)
+    try:
+        return "~/" + str(p.relative_to(pathlib.Path.home()))
+    except ValueError:
+        return str(p)
+
+
 def claim_name(d, today):
     """Атомарный захват имени. O_EXCL — единственное, что различает два `new` в
     одну секунду: проверка exists() перед записью проигрывает гонку молча.
@@ -200,7 +215,7 @@ def cmd_new(a):
     box.dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().date()
     name = claim_name(box.dir, today)
-    entry = yaml_quote(f"{box.repo.name} · {box.branch or '?'}") if box.repo else "none"
+    entry = yaml_quote(f"{display_path(box.repo)} · {box.branch or '?'}") if box.repo else "none"
     path = box.dir / f"{name}.md"
     path.write_text(TEMPLATE.format(
         title=yaml_quote(a.title),
