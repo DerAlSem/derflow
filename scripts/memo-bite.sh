@@ -40,7 +40,7 @@ M="${MEMO:-$HOME/.claude/scripts/memo.py}"
 ROOT="$(mktemp -d)"; trap 'rm -rf "$ROOT"' EXIT
 export MEMO_HOME="$ROOT/home"        # вердикты НЕ в живой ~/.claude
 mkdir -p "$MEMO_HOME"
-pass=0; fail=0
+pass=0; fail=0; RC_FRESH=0
 
 mk() {  # mk <имя> → печатает путь к свежему репозиторию с гейтом-счётчиком
   d="$ROOT/$1"; mkdir -p "$d"
@@ -66,6 +66,7 @@ runs() { [ -f "$1/runs.log" ] && wc -l < "$1/runs.log" | tr -d ' ' || echo 0; }
 chk() {  # chk <ожидаемый rc> <ярлык> [<подстрока>|!<подстроки быть не должно>]
   want="$1"; label="$2"; needle="${3:-}"
   out="$(cd "$D" && python3 "$M" ${ARG:-check} 2>&1)"; rc=$?
+  RC_FRESH=1
   ok=1
   [ "$rc" = "$want" ] || ok=0
   case "$needle" in
@@ -95,11 +96,21 @@ cnt() {  # cnt <ожидаемое число прогонов> <ярлык> [<�
   # конфига тривиально истинно и на настоящем memo, и на пустой заглушке —
   # та gate.py не запускает вообще никогда, вне зависимости от причины.
   # Замер 08.09.2026 на заглушке: без сверки rc этот укус был зелёным впустую.
-  # Правило порядка: `cnt` с 3-м параметром звать ТОЛЬКО непосредственно
-  # после `chk` — иначе `$rc` протухший, от чужого, более раннего вызова.
+  # Правило порядка: `cnt` с 3-м параметром звать ТОЛЬКО непосредственно после
+  # `chk` — иначе `$rc` протухший, от чужого, более раннего вызова. До
+  # 10.09.2026 это держалось СОГЛАШЕНИЕМ, то есть ничем: перестановка строк
+  # молча превращала укус в сверку со случайным кодом. Теперь держится сторожем
+  # RC_FRESH — `chk` его ставит, `cnt` съедает.
   got="$(runs "$D")"; ok=1
   [ "$got" = "$1" ] || ok=0
-  [ -z "${3:-}" ] || [ "$rc" = "$3" ] || ok=0
+  if [ -n "${3:-}" ]; then
+    if [ "${RC_FRESH:-0}" != 1 ]; then
+      echo "  ❌ $2 — cnt с 3-м параметром вызван не сразу после chk: \$rc протухший"
+      fail=$((fail+1)); RC_FRESH=0; return
+    fi
+    RC_FRESH=0
+    [ "$rc" = "$3" ] || ok=0
+  fi
   if [ "$ok" = 1 ]; then echo "  ✅ $2 (прогонов: $got)"; pass=$((pass+1))
   else
     echo "  ❌ $2 — ждали прогонов $1${3:+ и rc=$3}, получили прогонов $got, rc=${rc:-?}"
@@ -465,6 +476,78 @@ if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q "слишком коротки�
   echo "  ✅ forget \"\" отказывает кодом 2 и не удаляет ни одного вердикта"; pass=$((pass+1))
 else
   echo "  ❌ forget \"\": rc=$rc (ждали 2), вердиктов до=${before:-?} после=${after:-?} (ждали 2 и 2)"
+  echo "$out" | sed 's/^/       /'; fail=$((fail+1))
+fi
+
+# ── долги финального ревью, закрываются 10.09.2026 ───────────────────────────
+
+# 1. git не в PATH — обещан код 2, а был трейсбек. Питон зовём абсолютным путём:
+#    с пустым PATH шелл не нашёл бы и его, и укус проверял бы не то.
+PY_ABS="$(command -v python3)"
+D="$(mk r1)"
+out="$(cd "$D" && PATH=/nonexistent-bin "$PY_ABS" "$M" check 2>&1)"; rc=$?
+if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q "git" \
+    && ! printf '%s' "$out" | grep -q "Traceback"; then
+  echo "  ✅ без git в PATH — код 2 с диагнозом, а не трейсбек"; pass=$((pass+1))
+else
+  echo "  ❌ без git в PATH: rc=$rc (ждали 2), трейсбек=$(printf '%s' "$out" | grep -c Traceback)"
+  echo "$out" | sed 's/^/       /'; fail=$((fail+1))
+fi
+
+# 2. list не врёт «конфига нет», когда конфиг ЕСТЬ, а нечитаем внешний вход.
+#    Широкий except SystemExit глотал die про внешний вход и печатал ложный диагноз.
+D="$(mk r2)"
+printf '{"gate_pure": ["python3 gate.py"], "gate_version_external": ["no-such-input.txt"]}\n' > "$D/deploy.json"
+git -C "$D" add -A; git -C "$D" commit -qm ext
+out="$(cd "$D" && python3 "$M" list 2>&1)"
+# Обе половины. Одного «не содержит „конфига нет“» мало: на пустой заглушке это
+# истинно даром — она вообще ничего не печатает. Замер 10.09.2026: без
+# положительной половины укус был зелёным на заглушке, то есть не проверял ничего.
+if printf '%s' "$out" | grep -q "внешний вход" \
+    && ! printf '%s' "$out" | grep -q "конфига нет"; then
+  echo "  ✅ нечитаемый внешний вход назван собой, а не отсутствием конфига"; pass=$((pass+1))
+else
+  echo "  ❌ list не назвал нечитаемый внешний вход (или соврал «конфига нет»)"
+  echo "$out" | sed 's/^/       /'; fail=$((fail+1))
+fi
+
+# 3. Упавшая запись не оставляет осиротевший .tmp-<pid>. Ломаем os.replace,
+#    подставив на место файла вердикта КАТАЛОГ.
+D="$(mk r3)"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+rid="$(cd "$D" && python3 "$M" list | sed -n 's/^репозиторий: \([^ ]*\).*/\1/p')"
+vd="$MEMO_HOME/gate-verdicts/$rid"
+vf="$(ls "$vd"/*.json 2>/dev/null | head -1)"
+rm -f "$vf"; mkdir -p "$vf"
+out="$(cd "$D" && python3 "$M" check 2>&1)"; rc=$?
+orph="$(ls "$vd" 2>/dev/null | grep -c 'tmp-' || true)"
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "НЕ записан" && [ "$orph" = 0 ]; then
+  echo "  ✅ упавшая запись не оставляет осиротевший .tmp"; pass=$((pass+1))
+else
+  echo "  ❌ осиротевший .tmp: rc=$rc (ждали 0), .tmp-файлов=$orph (ждали 0)"
+  echo "$out" | sed 's/^/       /'; fail=$((fail+1))
+fi
+
+# 4. check — точка, где принимается решение, — обязан называть интерпретатор,
+#    под которым вердикт снят. Решение Р5 обещало отпечаток только в list.
+D="$(mk r4)"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+out="$(cd "$D" && python3 "$M" check 2>&1)"; rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "python"; then
+  echo "  ✅ попадание в кэш называет интерпретатор вердикта"; pass=$((pass+1))
+else
+  echo "  ❌ check на кэше молчит про интерпретатор: rc=$rc"
+  echo "$out" | sed 's/^/       /'; fail=$((fail+1))
+fi
+
+# 5. duration_s писался и не читался никем. Читает list.
+D="$(mk r5)"
+(cd "$D" && python3 "$M" check >/dev/null 2>&1)
+out="$(cd "$D" && python3 "$M" list 2>&1)"
+if printf '%s' "$out" | grep -q "длит"; then
+  echo "  ✅ list показывает длительность прогона — duration_s больше не мёртв"; pass=$((pass+1))
+else
+  echo "  ❌ list не показывает длительность: поле duration_s пишется и не читается"
   echo "$out" | sed 's/^/       /'; fail=$((fail+1))
 fi
 

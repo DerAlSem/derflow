@@ -51,7 +51,13 @@ def die(code, msg):
 
 
 def git(*args, cwd=None):
-    p = subprocess.run(("git",) + args, cwd=cwd, capture_output=True, text=True)
+    # Отсутствие самого git — не «git ответил ошибкой», а «спросить некого»:
+    # subprocess бросает FileNotFoundError ДО всякого кода возврата. Без этой
+    # ветки инструмент, обещающий коды 0/1/2, отдавал трейсбек.
+    try:
+        p = subprocess.run(("git",) + args, cwd=cwd, capture_output=True, text=True)
+    except (FileNotFoundError, PermissionError) as e:
+        die(2, f"git не запускается — {e}. Без git нет ни репозитория, ни дерева.")
     return p.returncode, p.stdout.strip(), p.stderr.strip()
 
 
@@ -196,11 +202,13 @@ def run_gate(ctx, gate):
             rc = subprocess.run(argv, cwd=ctx.toplevel).returncode
         except (FileNotFoundError, PermissionError, OSError) as e:
             print(f"гейт красный: «{cmd}» не запустилась — {e}")
-            return False, round(time.monotonic() - started, 1), cmd
+            return False, round(time.monotonic() - started, 1)
         if rc != 0:
             print(f"гейт красный: «{cmd}» вышла кодом {rc}. Вердикт НЕ записан.")
-            return False, round(time.monotonic() - started, 1), cmd
-    return True, round(time.monotonic() - started, 1), None
+            return False, round(time.monotonic() - started, 1)
+    # Пара, не тройка: упавшую команду печатает сам run_gate строкой выше, и
+    # третий элемент никто никогда не читал.
+    return True, round(time.monotonic() - started, 1)
 
 
 def session_id():
@@ -273,8 +281,15 @@ def write_verdict(path, payload):
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f"{path.name}.tmp-{os.getpid()}"
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    # finally, а не «и так заменится»: любой отказ между созданием tmp и
+    # os.replace (нет места, на месте вердикта каталог, права) оставлял файл
+    # .tmp-<pid> навсегда — никто их не подметал. После удачной подмены tmp уже
+    # не существует, поэтому missing_ok.
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def cmd_check(a):
@@ -287,13 +302,22 @@ def cmd_check(a):
     if can_cache:
         v = read_verdict(vp, gate)
         if v:
+            # Интерпретатор печатается ЗДЕСЬ, а не только в `list`: решение Р5
+            # оставило отпечаток диагностикой, но диагностика, которой нет в
+            # точке принятия решения, не работает. В ключ он по-прежнему не
+            # входит — это строка для человека, а не условие.
+            env = v.get("env") or {}
+            pv = env.get("python_version", "?")
+            cur = ".".join(str(x) for x in sys.version_info[:3])
             print(f"гейт пройден: дерево {ctx.tree_sha[:12]} · gv {gv} · "
-                  f"{v.get('recorded_at', '?')} · сессия {v.get('session', '?')}")
+                  f"{v.get('recorded_at', '?')} · python {pv}"
+                  f"{'' if pv == cur else f' (сейчас {cur})'} · "
+                  f"сессия {v.get('session', '?')}")
             return 0
     else:
         print(f"кэш выключен: {why}")
 
-    ok, took, _ = run_gate(ctx, gate)
+    ok, took = run_gate(ctx, gate)
     if not ok:
         return 1
 
@@ -310,6 +334,10 @@ def cmd_check(a):
             "recorded_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
             "host": socket.gethostname(),
             "session": session_id(),
+            # `worktree` и `external` кодом не читаются намеренно: это улики
+            # для человека, открывшего json руками, — из какого дерева снят
+            # вердикт и какие внешние входы вошли в ключ. `duration_s` читает
+            # `memo list`: по нему видно, что именно экономит кэш.
             "worktree": str(ctx.toplevel),
             "duration_s": took,
             "commands": list(gate),
@@ -353,15 +381,25 @@ def cmd_list(a):
     print(f"грязное:     {'да, файлов ' + str(len(ctx.dirty)) if ctx.dirty else 'нет'}")
     # list читает конфиг МЯГКО: смотреть кэш надо и в репозитории без конфига,
     # иначе инструмент «посмотреть и сбросить» отказывает ровно там, где нужен.
+    # Отказы ловятся ПООТДЕЛЬНОСТИ. Один широкий except SystemExit глотал и
+    # die про нечитаемый внешний вход, и печатал «конфига нет» — диагноз, прямо
+    # противоречащий тому, что die уже написал в stderr. `list` обязан
+    # оставаться мягким (это инструмент «посмотреть и сбросить», он нужен
+    # именно когда сломано), но мягкость не значит право врать о причине.
     try:
         cfgpath, gate, ext = load_config(ctx, a.config)
-        gv, _ = gate_version(ctx, ext)
-        print(f"ключ gv:     {gv}   ({len(ext)} внешних входов, {len(gate)} команд)")
-        can, why = cacheable(ctx, cfgpath)
-        if not can:
-            print(f"кэш:         выключен — {why}")
     except SystemExit:
-        print("ключ gv:     — (конфига нет либо он невалиден)")
+        print("ключ gv:     — конфига нет либо он невалиден")
+    else:
+        try:
+            gv, _ = gate_version(ctx, ext)
+        except SystemExit:
+            print("ключ gv:     — внешний вход gate_version_external не читается")
+        else:
+            print(f"ключ gv:     {gv}   ({len(ext)} внешних входов, {len(gate)} команд)")
+            can, why = cacheable(ctx, cfgpath)
+            if not can:
+                print(f"кэш:         выключен — {why}")
 
     dirs = sorted(VERDICTS.glob("*")) if a.all else [VERDICTS / ctx.repo_id]
     rows = _load_rows(dirs)
@@ -369,13 +407,15 @@ def cmd_list(a):
         print("вердиктов нет")
         return 0
     print()
-    print(f"  {'дерево':13} {'gv':13} {'снят':20} {'хост':14} {'python':10} сессия")
+    print(f"  {'дерево':13} {'gv':13} {'снят':20} {'хост':14} {'python':10} {'длит':8} сессия")
     for v in sorted(rows, key=lambda r: r.get("recorded_at", ""), reverse=True):
         mark = "→" if v.get("tree_sha") == ctx.tree_sha else " "
         env = v.get("env", {}) or {}
         print(f"{mark} {v.get('tree_sha', '')[:12]:13} {v.get('gate_version', ''):13} "
               f"{v.get('recorded_at', '')[:19]:20} {str(v.get('host', ''))[:13]:14} "
-              f"{str(env.get('python_version', ''))[:9]:10} {v.get('session', '')}")
+              f"{str(env.get('python_version', ''))[:9]:10} "
+              f"{(str(v['duration_s']) + ' с') if v.get('duration_s') is not None else '—':8} "
+              f"{v.get('session', '')}")
     return 0
 
 
@@ -406,7 +446,13 @@ def cmd_forget(a):
         print("нечего забывать")
         return 0
     for t in targets:
-        t.unlink()
+        try:
+            t.unlink()
+        except FileNotFoundError:
+            # Сестринская сессия успела забыть тот же вердикт между glob и
+            # unlink. Это не отказ: файла нет — цель достигнута, и печатать
+            # «забыт» о чужой работе тоже незачем.
+            continue
         print(f"забыт: {t.name}")
     return 0
 
