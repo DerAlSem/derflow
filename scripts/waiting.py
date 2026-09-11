@@ -8,6 +8,7 @@
     waiting.py probe
     waiting.py taken <id> "<почему>"
     waiting.py ack <id>
+    waiting.py wake
 
 Строка — файл `<repo>/.claude/waiting/YYYYMMDD-NN.md` ОСНОВНОГО чекаута,
 беспроектная — `~/.claude/waiting/`. У файла один писатель, и это человек:
@@ -729,6 +730,128 @@ def cmd_probe(a):
     return 4 if bad else 0
 
 
+def detach_probe():
+    """Старт сессии не ждёт ssh НИКОГДА (укус 17).
+
+    start_new_session=True обязателен: иначе дочерний процесс умрёт вместе с
+    группой сессии, и проба, начатая на старте, не доживёт до записи кэша.
+    Потоки в /dev/null — всё, что фон говорит, живёт в кэше и в квитанции
+    прогона, а не в чьём-то stdout.
+    """
+    try:
+        subprocess.Popen(
+            [sys.executable, str(pathlib.Path(__file__).resolve()), "probe"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass        # не вышло отцепить — это не повод ронять старт сессии
+
+
+def registry_broken(now):
+    """Молчание реестра — само событие. Возвращает текст или None.
+
+    Если проба падает при старте, кэш просто перестаёт обновляться: исходы
+    остаются прежними, дельта пуста, `list` печатает вчерашнюю правду. Молчащий
+    реестр неотличим от пустого, а пустой — нормальное состояние, поэтому
+    тревогу не поднимет никто.
+
+    🔴 Своего ОТСУТСТВИЯ `wake` обнаружить не может: если запись хука пропала из
+    settings.json (а файл правят 4–6 сессий), его просто никто не зовёт. Этот
+    класс закрывает только `doctor`, и потому он отдельная команда для человека.
+
+    Это ЕДИНСТВЕННАЯ строка, которой позволено нарушить «пустая дельта пуста».
+    """
+    try:
+        run = json.loads(RUN.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None     # прогонов не было вовсе — это старт, а не поломка
+    if run.get("stale_lock_broken"):
+        return ("предыдущий фоновый прогон не дожил до конца — замок снимали "
+                "протухшим; исходы могли остаться вчерашними")
+    ts = run.get("finished_at_ts")
+    if not isinstance(ts, (int, float)):
+        return "квитанция фонового прогона без времени — фон писал её сломанным"
+    if now - ts > 3 * CACHE_TTL_S:
+        return (f"фоновая проба не отчитывалась {int((now - ts) / 3600)} ч — "
+                f"реестр печатает вчерашнюю правду")
+    return None
+
+
+def why_line(kind, key, row, c):
+    """Причина одной строкой. Класс назван словами, а не кодом."""
+    if kind == "форма":
+        why = [row.error] if row.error else row.faults
+        return "форма не сходится: " + "; ".join(why)
+    if kind == "fired":
+        return (f"проба СРАБОТАЛА (серия с {key}) — "
+                f"{field_or(row, 'ripe_when', 'решение прозой не названо')}")
+    if kind == "unreachable":
+        note = (c or {}).get("note") or ""
+        return f"недостижима с {key}, дольше суток" + (f" — {note}" if note else "")
+    tail = ("" if field_or(row, "probe", "") != "none"
+            else " — машинной пробы нет, срок единственный датчик")
+    return f"срок пересмотра {key} прошёл{tail}"
+
+
+def wake():
+    """Дельта на старте сессии. Собирается В ПАМЯТИ и печатается одним куском.
+
+    🔑 Вывод хука уходит в КОНТЕКСТ АССИСТЕНТА, а не на экран человека
+    (проверено 08.09.2026). Значит «печатает» — неверное слово: хук КЛАДЁТ
+    дельту в контекст, а вынести её на экран обязан ассистент, и это сказано
+    строкой в самом выводе. Иначе созревшая строка будет прочитана и не названа.
+
+    Р16: печать одним куском в конце. По ходу — и исключение на середине
+    оставило бы в контексте половину дельты, неотличимую от полной.
+    """
+    today = datetime.now().date()
+    now = time.time()
+    items, stale = [], False
+    for row in scan():
+        c = cache_of(row)
+        kinds = reasons(row, c, today, now)
+        if kinds and unacked(row, kinds):
+            items.append((row, kinds, c))
+        if probeable(row):
+            ts = (c or {}).get("last_run_at_ts")
+            if not isinstance(ts, (int, float)) or now - ts > CACHE_TTL_S:
+                stale = True
+    broken = registry_broken(now)
+    if stale:
+        detach_probe()
+    if not items and not broken:
+        # 🔴 Ноль байт. Не «событий нет», не пустая строка, не заголовок без
+        # содержимого: требование стоит токенов на каждом из шести стартов.
+        return 0
+    lines = ["РЕЕСТР НЕ-СЕЙЧАС-РАБОТЫ — дельта на старте сессии."]
+    if broken:
+        lines.append(f"🔴 реестр молчит: {broken}")
+    for row, kinds, c in sorted(items, key=lambda it: sort_key(it[0])):
+        lines.append(f"  {row.id}  {field_or(row, 'title', '(без title)')}")
+        for kind, key in kinds:
+            lines.append(f"      • {why_line(kind, key, row, c)}")
+    lines.append("Это лежит в контексте, а НЕ на экране человека: назови дельту "
+                 "вслух своими словами. Неназванная созревшая строка потеряна.")
+    lines.append("`ack`, `taken` и `done` зовутся ТОЛЬКО по прямой просьбе "
+                 "владельца: ассистент, погасивший дельту сам, уничтожает "
+                 "строку при ненаступившей отработке.")
+    print("\n".join(lines))
+    return 0
+
+
+def cmd_wake(a):
+    """Хук не имеет права уронить старт сессии: падение = НОЛЬ ВЫВОДА.
+
+    Радиус глобальный — старт ЛЮБОЙ сессии в любом проекте. Поэтому наружу
+    всегда нуль и поэтому ловится всё: сломанный кэш, уехавший корень, чужой
+    файл в ящике. Ни одно из этого не стоит отказа старта.
+    """
+    try:
+        return wake()
+    except Exception:
+        return 0
+
+
 def vanished(rows):
     """Пропажа из скана — событие, и печатается она ОДИН раз.
 
@@ -1252,6 +1375,9 @@ def main(argv=None):
     p_ack = sub.add_parser("ack", help="квитанция: видел, ждём дальше")
     p_ack.add_argument("id", help="<repo-id>/YYYYMMDD-NN либо голый YYYYMMDD-NN")
     p_ack.set_defaults(fn=cmd_ack)
+
+    p_wake = sub.add_parser("wake", help="дельта в контекст (зовётся хуком)")
+    p_wake.set_defaults(fn=cmd_wake)
 
     a = ap.parse_args(argv)
     return a.fn(a)
