@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""waiting — реестр не-сейчас-работы: строка и хранилище (поставка 2-1).
+"""waiting — реестр не-сейчас-работы: строка, хранилище, пробуждение.
 
     waiting.py new "<заголовок>" [--global]
     waiting.py list [--all]
     waiting.py done <id> "<почему>"
     waiting.py stamp <id>
+    waiting.py probe
 
 Строка — файл `<repo>/.claude/waiting/YYYYMMDD-NN.md` ОСНОВНОГО чекаута,
 беспроектная — `~/.claude/waiting/`. У файла один писатель, и это человек:
@@ -18,18 +19,13 @@
 самую тишину, против которой написан весь реестр.
 
 Коды: 0 сделано либо печатать нечего · 1 форма строки · 2 конфигурация либо
-положение. Коды 3 (замок занят) и 4 (проба не смогла спросить) принадлежат
-поставке 2-2 и здесь не возвращаются никогда.
-
-Команд ровно четыре. `ack` и `doctor` принадлежат поставке 2-2 (решение Р1
-плана), и их отсутствие здесь — не недоделка: `ack` пишет класс исхода, а в 2-1
-исход у каждой строки ровно один — кэша не заполняет никто, — так что от `stamp`
-он был бы неотличим; `doctor` сверяет запись хука в настройках и свежесть кэша,
-а оба артефакта заводит 2-2, и на исправном реестре 2-1 он обязан был бы кричать
-«реестр сломан».
+положение · 3 замок занят (не ошибка) · 4 проба не смогла спросить. Коды 3 и 4
+возвращает ТОЛЬКО `probe` (Р17 плана 2-2): код `wake` читает харнесс, а не
+человек, и ненулевой код хука — сообщение о сбое, не о состоянии реестра.
+**Код 5 не занят:** у 1b он значит «нужно решение владельца».
 
 Спека: ~/.claude/specs/2026-09-08-waiting-registry.md
-План:  ~/.claude/plans/2026-09-10-waiting-registry-2-1.md
+План:  ~/.claude/plans/2026-09-11-waiting-registry-2-2.md (2-1 — предшественница)
 """
 
 import argparse
@@ -38,6 +34,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -57,7 +54,17 @@ ROOTS = HOME / "waiting-roots.txt"
 HOME_REPO_ID = "home"            # Р4: у ящика дома id фиксирован
 DAYS_WITH_PROBE = 30             # инвариант 5: подстраховка там, где спрашивает машина
 DAYS_NO_PROBE = 7                # инвариант 5: единственный датчик там, где не спрашивает никто
-CACHE_TTL_S = 3600               # Р11: временное число, выбирается после миграции
+CACHE_TTL_S = 3600               # Р11: временное число, выбирается замером (Р13 плана 2-2)
+LOCK = HOME / "waiting-lock"     # замок пробы: экономия на ssh, НЕ условие корректности
+RUN = CACHE / "_run.json"        # квитанция прогона (Р19): писатель — держатель замка
+PROBE_TIMEOUT_S = int(os.environ.get("WAITING_PROBE_TIMEOUT_S") or 30)
+LOCK_TTL_S = 900                 # 30-кратный запас над потолком пробы (Р15)
+SSH_CONNECT_TIMEOUT_S = 10
+STALE_UNREACHABLE_S = 86400      # «недостижима дольше суток» — дельта (укус 10)
+# Р18: транспорт и его потолок подменяются ради стенда — как WAITING_HOME у 2-1.
+# Стенд обязан работать без сети: иначе укус про код 255 либо не воспроизводится,
+# либо стучится в живой mprz.
+SSH = os.environ.get("WAITING_SSH") or "ssh"
 
 
 def die(code, msg):
@@ -532,6 +539,191 @@ def cache_of(row):
     return c if isinstance(c, dict) else None
 
 
+def take_lock():
+    """Замок пробы. Возвращает (взят ли, снят ли протухший).
+
+    Замок — экономия на ssh, а НЕ условие корректности: корректность держится
+    разрезом кэша по файлам с одним писателем каждый. Нужен затем, чтобы шесть
+    сессий, стартовавших в одну минуту, не позвали ssh шесть раз.
+    """
+    CACHE.mkdir(parents=True, exist_ok=True)
+    try:
+        LOCK.mkdir(parents=True)
+        return True, False
+    except FileExistsError:
+        pass
+    try:
+        age = time.time() - LOCK.stat().st_mtime
+    except OSError:
+        return False, False
+    if age <= LOCK_TTL_S:
+        return False, False
+    # Держатель не дожил до снятия. Проба, попросившая пароль, висит без TTY и
+    # держала бы замок до его TTL — тогда не опросилась бы НИ ОДНА строка, а
+    # снаружи это выглядит как «все молчат».
+    try:
+        LOCK.rmdir()
+        LOCK.mkdir()
+    except OSError:
+        return False, False      # успел другой: это его очередь, а не ошибка
+    return True, True
+
+
+def write_json(path, obj):
+    """Атомарно. Обрыв посередине оставил бы кэш нечитаемым, а нечитаемый кэш
+    честно читается как «ни разу не опрошена» — то есть событие потерялось бы.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def probeable(row):
+    """Кого фон спрашивает (Р20). Четыре класса не спрашиваются никогда.
+
+    done и taken — потому что не будят; недооформленные — потому что спрашивать
+    нечем и форма уже названа дельтой; probe: none — по спеке. Довод не экономия:
+    проба по строке с полупустой формой ходила бы в сеть по угаданным полям.
+    """
+    if row.error or row.faults:
+        return False
+    if state_of(row) in ("done", "taken"):
+        return False
+    probe = row.fields.get("probe")
+    return probe is not None and probe.value != "none"
+
+
+def probe_call(row):
+    """Как позвать пробу. Возвращает (argv, скрипт для stdin).
+
+    Скрипт уезжает в STDIN, а не в аргумент: иначе кавычки живой пробы пришлось
+    бы экранировать дважды — для своего шелла и для удалённого, — и четыре живые
+    строки с многострочным SQL сломались бы на этом молча.
+
+    `bash -o pipefail`, а не голый bash: живые пробы это грепы по журналу через
+    конвейер, и без pipefail код возврата брал бы ПОСЛЕДНЮЮ команду конвейера,
+    то есть «источник ответил» подменялось бы «хвост дочитался».
+    """
+    cwd = row.fields["cwd"].value
+    # Р21: тильду раскрывает шелл-ПРИЁМНИК — на удалённом хосте дом не наш, а
+    # shlex.quote её экранирует и cd промахивается. Предел назван вслух: путь с
+    # тильдой И пробелом сразу не поддержан, и отказ смещён в безопасную сторону
+    # — cd не найдёт каталога, скрипт выйдет 91, исход будет unreachable с
+    # названной причиной, а не тихое «молчит».
+    where = cwd if cwd.startswith("~/") else shlex.quote(cwd)
+    script = f"cd {where} || exit 91\n{row.fields['probe'].value}\n"
+    host = row.fields["host"].value
+    if host == "local":
+        return ["bash", "-o", "pipefail", "-s"], script
+    # BatchMode=yes обязателен: фон отцеплен, TTY у него нет, и проба,
+    # попросившая пароль, повисла бы и удержала замок до его TTL.
+    return [SSH, "-o", "BatchMode=yes",
+            "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT_S}",
+            host, "bash", "-o", "pipefail", "-s"], script
+
+
+def probe_one(row):
+    """Три вопроса, а не один. Возвращает (исход, код ПРОБЫ, причина).
+
+    Ни один из трёх не выводится из ответа на другой: `grep` без совпадений
+    выходит кодом 1, а живые пробы — это грепы по журналу (14 в нынешнем
+    реестре). Вывести исход из одного кода значило бы присылать ложную тревогу
+    по честно молчащей строке на каждом из шести стартов, и дельту перестали бы
+    читать за неделю. Тот же результат, что у лжи в сторону тишины, только с
+    другой стороны.
+    """
+    argv, script = probe_call(row)
+    try:
+        p = subprocess.run(argv, input=script, capture_output=True, text=True,
+                           timeout=PROBE_TIMEOUT_S)
+    except (FileNotFoundError, PermissionError) as e:
+        return "unreachable", 127, f"нечем спросить — {e}"
+    except subprocess.TimeoutExpired:
+        return "unreachable", 124, f"потолок пробы {PROBE_TIMEOUT_S} с исчерпан"
+    if p.returncode == 255:
+        return "unreachable", 255, "транспорт отказал (ssh: 255)"
+    if p.returncode == 91:
+        return "unreachable", 91, f"cwd не нашёлся: {row.fields['cwd'].value}"
+    if p.returncode != 0:
+        return "unreachable", p.returncode, f"проба вышла кодом {p.returncode}"
+    try:
+        rx = re.compile(row.fields["ripe_match"].value)
+    except re.error as e:
+        # Громкая сторона: непонятая регулярка — это «не смогли спросить», а не
+        # «событие не наступило». Проглотить её тихо значит соврать в тишину.
+        return "unreachable", 1, f"ripe_match не компилируется — {e}"
+    return ("fired" if rx.search(p.stdout) else "silent"), 0, ""
+
+
+def write_cache(row, outcome, probe_rc, note):
+    """Кэш строки: исход, начало серии, два кода и ДВА СЧЁТЧИКА ЗАМЕРА (Р13).
+
+    🔴 `last_rc` — код ПРОГОНА, `probe_rc` — код ПРОБЫ. Классификатор читает
+    `last_rc != 0` как поломку реестра; положить туда код упавшей пробы значит
+    отправить каждую недостижимую строку в «данные протухли» вместо
+    «недостижима» — то есть сломать инвариант 3 там, где он и охраняется.
+    Рука делает это сама: поле называется «rc», проба вернула «rc».
+    """
+    old = cache_of(row) or {}
+    same = old.get("outcome") == outcome
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    c = {
+        "outcome": outcome,
+        # Начало ТЕКУЩЕЙ серии этого исхода — ключ водяного знака (Р9). Та же
+        # серия продолжается — `since` не двигается; сменился исход — новая.
+        "since": (old.get("since") or now_iso) if same else now_iso,
+        "last_run_at_ts": time.time(),
+        "last_rc": 0,            # прогон состоялся, чем бы ни кончилась проба
+        "probe_rc": probe_rc,
+        "note": note,
+        "same_truth_runs": int(old.get("same_truth_runs") or 0) + (1 if same else 0),
+        "changed_runs": int(old.get("changed_runs") or 0) + (0 if same else 1),
+    }
+    p = CACHE / row.box.repo_id / f"{row.name}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    write_json(p, c)
+
+
+def cmd_probe(a):
+    """Фоновый опрос. Не актор (инвариант 8): ничего не решает и не чинит.
+
+    Код 3 — замок занят, и это НЕ ошибка. Код 4 — хоть одна строка не смогла
+    спросить; он отделён от 0 намеренно, иначе возвращается ровно тот дефект,
+    ради которого написан инвариант 3.
+    """
+    ok, broken = take_lock()
+    if not ok:
+        print("замок занят — фоновая проба уже идёт")
+        return 3
+    started = datetime.now().isoformat(timespec="seconds")
+    bad = 0
+    try:
+        rows = [r for r in scan() if probeable(r)]
+        for row in rows:
+            outcome, probe_rc, note = probe_one(row)
+            write_cache(row, outcome, probe_rc, note)
+            if outcome == "unreachable":
+                bad += 1
+            print(f"{row.id}: {outcome}" + (f" — {note}" if note else ""))
+        write_json(RUN, {
+            "started_at": started,
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at_ts": time.time(),
+            "rows": len(rows),
+            "unreachable": bad,
+            "stale_lock_broken": broken,
+        })
+    finally:
+        try:
+            LOCK.rmdir()
+        except OSError:
+            pass
+    if broken:
+        print("снят протухший замок пробы — предыдущий прогон не дожил до конца")
+    return 4 if bad else 0
+
+
 def vanished(rows):
     """Пропажа из скана — событие, и печатается она ОДИН раз.
 
@@ -882,6 +1074,9 @@ def main(argv=None):
     p_stamp = sub.add_parser("stamp", help="пере-вывести срок по нынешней probe")
     p_stamp.add_argument("id", help="<repo-id>/YYYYMMDD-NN либо голый YYYYMMDD-NN")
     p_stamp.set_defaults(fn=cmd_stamp)
+
+    p_probe = sub.add_parser("probe", help="опросить строки (зовётся фоном)")
+    p_probe.set_defaults(fn=cmd_probe)
 
     a = ap.parse_args(argv)
     return a.fn(a)

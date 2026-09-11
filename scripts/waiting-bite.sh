@@ -83,6 +83,23 @@ mk() {  # mk <имя> → печатает путь к свежему репоз
   git -C "$d" add -A; git -C "$d" commit -qm init
   printf '%s' "$d"
 }
+# Р18: транспорт подменяется — стенд обязан работать без сети и без чужих хостов.
+# Хост приезжает аргументом, поэтому распознаём его перебором: `refuse` роняет
+# транспорт кодом 255, `slow` висит дольше потолка пробы, остальные исполняют
+# скрипт местно — то есть дают настоящие fired и silent.
+export WAITING_SSH="$ROOT/fake-ssh"
+export WAITING_PROBE_TIMEOUT_S=1
+cat > "$WAITING_SSH" <<'FAKESSH'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    refuse) exit 255 ;;
+    slow)   sleep 3 ;;
+  esac
+done
+exec bash -o pipefail -s
+FAKESSH
+chmod +x "$WAITING_SSH"
 wt() {  # wt <каталог> <аргументы waiting.py…> → $out, $rc
   d="$1"; shift
   out="$(cd "$d" && python3 "$W" "$@" 2>&1)"; rc=$?
@@ -500,6 +517,7 @@ cache() {  # cache <repo-id> <имя строки> <json одной строко
 NOW="$(date +%s)"
 OLD="$((NOW - 4 * 3600))"          # старше 3×TTL при TTL=3600
 HB="$WAITING_HOME/waiting"
+HC="$WAITING_HOME/waiting-cache"
 
 echo "=== исход берётся из кэша, созрелость вычисляется ==="
 
@@ -857,6 +875,146 @@ after="$(tr -cd '\r' < "$HB/20260808-05.md" | wc -c | tr -d ' ')"
 is "stamp сохранил CRLF: правка по ключу не переписывает файл в LF" $?
 { inf "$HB/20260808-05.md" "review_by: $PLUS30     # комментарий человека"; }
 is "…и хвостовой комментарий с выравниванием уцелел и в CRLF-файле" $?
+
+echo "=== три вопроса: код транспорта, код команды, совпадение по stdout ==="
+
+prb() {  # prb <ящик> <имя> <host> <cwd> <команда> <ripe_match>
+  line "$1" "$2" <<EOF
+---
+title: "проба $2"
+state: waiting
+review_by: $PLUS30
+stamped_at: $TODAY
+host: $3
+cwd: $4
+probe: |
+  $5
+ripe_match: "$6"
+ripe_when: "то самое решение"
+sample: "видел оба исхода 11.09"
+entry: none
+---
+Тело.
+EOF
+}
+
+# Укус 8 спеки — центральное утверждение поставки, три половины в одном месте.
+prb "$HB" 20260707-11 local /tmp 'echo приёмник 10.0.0.1' 'приёмник'
+prb "$HB" 20260707-12 local /tmp 'echo ничего интересного' 'приёмник'
+prb "$HB" 20260707-13 local /tmp 'exit 7'                 'приёмник'
+prb "$HB" 20260707-14 refuse /tmp 'echo приёмник'         'приёмник'
+prb "$HB" 20260707-15 local /tmp 'grep приёмник /dev/null' 'приёмник'
+wt "$WAITING_HOME" probe
+{ [ "$rc" = 4 ] && has "20260707-11: fired"; }
+is "probe вернул 4 — хоть одна строка не смогла спросить, и это не 0" $?
+{ jq -er '.outcome=="fired" and .probe_rc==0' "$HC/home/20260707-11.json" >/dev/null; }
+is "совпадение по stdout → fired, и код пробы записан нулём" $?
+{ jq -er '.outcome=="silent" and .probe_rc==0' "$HC/home/20260707-12.json" >/dev/null; }
+is "пусто кодом 0 → silent: проба спросила, ответ был пуст" $?
+{ jq -er '.outcome=="unreachable" and .probe_rc==7' "$HC/home/20260707-13.json" >/dev/null \
+    && has "20260707-13: unreachable — проба вышла кодом 7"; }
+is "ненулевой код команды → unreachable, и код пробы назван" $?
+{ jq -er '.outcome=="unreachable" and .probe_rc==255' "$HC/home/20260707-14.json" >/dev/null \
+    && has "транспорт отказал (ssh: 255)"; }
+is "ssh с кодом 255 → unreachable по транспорту, а не по команде" $?
+# 🔴 Плановый укус требовал здесь silent — и противоречил и своему же probe_one,
+# и таблице «Три вопроса» спеки («ненулевой код команды → unreachable»). Спека
+# решает проблему грепа АРХИТЕКТУРНО: фильтрация уезжает из пробы в ripe_match, и
+# проба обязана выходить нулём. Особый случай для кода 1 был бы ложью в сторону
+# тишины — настоящий отказ, вышедший единицей, приезжал бы как «честно молчит».
+# Укус перевёрнут и стал сторожем ровно этого соблазна: код 7 (ниже) однозначен,
+# а единица — та, которую рука норовит простить.
+{ jq -er '.outcome=="unreachable" and .probe_rc==1' "$HC/home/20260707-15.json" >/dev/null; }
+is "🔴 код 1 у грепа — unreachable, а не silent: фильтрация живёт в ripe_match" $?
+# 🔴 Р14 живьём: last_rc — код ПРОГОНА, а не пробы. Пара проверяет обе стороны:
+# у недостижимой строки last_rc нуль, и list ставит её в «недостижима», а не в
+# «данные протухли». Реализация, сунувшая код пробы в last_rc, красит оба укуса.
+{ jq -er '.last_rc==0' "$HC/home/20260707-13.json" >/dev/null; }
+is "last_rc нуль у НЕДОСТИЖИМОЙ строки: прогон состоялся, проба — нет" $?
+wt "$WAITING_HOME" list
+{ grp 20260707-13 | grep -q "недостижима"; }
+is "…и list ставит её в «недостижима», а не в «данные протухли»" $?
+
+# Потолок пробы. WAITING_PROBE_TIMEOUT_S=1, подставной ssh спит 3.
+prb "$HB" 20260707-16 slow /tmp 'echo приёмник' 'приёмник'
+wt "$WAITING_HOME" probe
+{ [ "$rc" = 4 ] && has "20260707-16: unreachable — потолок пробы 1 с исчерпан"; }
+is "проба, вышедшая за потолок, — unreachable с названной причиной" $?
+{ jq -er '.probe_rc==124' "$HC/home/20260707-16.json" >/dev/null; }
+is "…и код 124 тот же, каким отвечает timeout — контракт не выдуман" $?
+
+# ripe_match, который не компилируется, — ГРОМКАЯ сторона.
+prb "$HB" 20260707-17 local /tmp 'echo приёмник' 'приёмник((('
+wt "$WAITING_HOME" probe
+{ has "20260707-17: unreachable — ripe_match не компилируется"; }
+is "непонятая регулярка → unreachable, а не «событие не наступило»" $?
+
+# cwd, которого нет: код 91 и НАЗВАННАЯ причина вместо тихого «молчит».
+prb "$HB" 20260707-18 local /nonexistent-dir-xyz 'echo приёмник' 'приёмник'
+wt "$WAITING_HOME" probe
+{ jq -er '.probe_rc==91' "$HC/home/20260707-18.json" >/dev/null \
+    && has "cwd не нашёлся: /nonexistent-dir-xyz"; }
+is "cwd не разрешился → unreachable кодом 91, причина названа (Р21)" $?
+
+echo "=== кого фон НЕ спрашивает и замок ==="
+
+# Р20: четыре класса. Положительная половина — у пятой строки кэш ПОЯВЛЯЕТСЯ.
+prb "$HB" 20260707-21 local /tmp 'echo приёмник' 'приёмник'
+line "$HB" 20260707-22 <<EOF
+---
+title: "взята в работу — фон её не спрашивает"
+state: taken
+review_by: $PLUS30
+stamped_at: $TODAY
+host: local
+cwd: /tmp
+probe: |
+  echo приёмник
+ripe_match: "приёмник"
+ripe_when: "то самое"
+sample: "видел оба исхода"
+entry: none
+taken_at: $TODAY
+taken_because: "начали 11.09"
+---
+Тело.
+EOF
+full "$HB" 20260707-23            # probe: none — спрашивать нечем
+line "$HB" 20260707-24 <<EOF
+---
+title: "недооформленная — полей пробы нет"
+state: waiting
+review_by: $PLUS30
+stamped_at: $TODAY
+entry: none
+---
+Тело.
+EOF
+rm -rf "$HC"
+wt "$WAITING_HOME" probe
+{ [ -f "$HC/home/20260707-21.json" ] && [ ! -f "$HC/home/20260707-22.json" ]; }
+is "state: taken из фонового опроса выпала, а waiting — опрошена" $?
+{ [ ! -f "$HC/home/20260707-24.json" ] && has "20260707-21: "; }
+is "недооформленная не опрашивается — полей пробы у неё нет" $?
+{ jq -er '.rows>=1' "$HC/_run.json" >/dev/null; }
+is "квитанция прогона записана: сколько строк спросили — видно" $?
+
+# Укус 15 спеки. Замок берётся ДО прогона, поэтому второй процесс не идёт в сеть.
+mkdir -p "$WAITING_HOME/waiting-lock"
+wt "$WAITING_HOME" probe
+{ [ "$rc" = 3 ] && has "замок занят"; }
+is "второй probe выходит 3 и в сеть не идёт — замок, а не гонка" $?
+rmdir "$WAITING_HOME/waiting-lock"
+
+# Протухший замок снимается — и ФАКТ снятия печатается (Р19).
+mkdir -p "$WAITING_HOME/waiting-lock"
+touch -A -020000 "$WAITING_HOME/waiting-lock" 2>/dev/null \
+  || touch -t "$(date -v-2H +%Y%m%d%H%M)" "$WAITING_HOME/waiting-lock"
+wt "$WAITING_HOME" probe
+{ [ "$rc" != 3 ] && has "снят протухший замок пробы"; }
+is "протухший замок снят, и снятие НАЗВАНО — тихое скрыло бы упавшую пробу" $?
+{ jq -er '.stale_lock_broken==true' "$HC/_run.json" >/dev/null; }
+is "…и записано в квитанцию прогона, а не только в stdout фона" $?
 
 echo
 echo "итог: ✅ $pass   ❌ $fail"
