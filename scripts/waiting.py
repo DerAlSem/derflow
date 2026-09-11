@@ -1238,14 +1238,26 @@ def vanished(rows):
     for d in sorted(CACHE.glob("*")):
         if not d.is_dir():
             continue
+        # Следов у строки ДВА — `<id>.json` от probe и `<id>.seen.json` от wake, —
+        # и оба принадлежат ОДНОМУ id. Голый `p.stem` давал у квитанции стем
+        # `<id>.seen`, которого в live нет никогда: живая строка объявлялась
+        # пропавшей, а квитанция гасилась вместе с фантомом. Замер 11.09 — по
+        # двенадцать таких строк на прогоне, и настоящая пропажа, ради которой
+        # эта функция и написана, тонула среди них. Собираем следы по имени
+        # СТРОКИ, и тогда пропажа называется один раз, а забывается целиком.
+        gone = {}
         for p in sorted(d.glob("*.json")):
-            if (d.name, p.stem) in live:
+            name = p.name[:-len(".seen.json")] if p.name.endswith(".seen.json") else p.stem
+            if (d.name, name) in live:
                 continue
-            print(f"строка {d.name}/{p.stem} пропала из скана — кэш о ней забыт")
-            try:
-                p.unlink()
-            except OSError:
-                pass
+            gone.setdefault(name, []).append(p)
+        for name, traces in sorted(gone.items()):
+            print(f"строка {d.name}/{name} пропала из скана — кэш о ней забыт")
+            for p in traces:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
 
 
 def resolve(arg, rows):
