@@ -6,6 +6,8 @@
     waiting.py done <id> "<почему>"
     waiting.py stamp <id>
     waiting.py probe
+    waiting.py taken <id> "<почему>"
+    waiting.py ack <id>
 
 Строка — файл `<repo>/.claude/waiting/YYYYMMDD-NN.md` ОСНОВНОГО чекаута,
 беспроектная — `~/.claude/waiting/`. У файла один писатель, и это человек:
@@ -375,8 +377,11 @@ def faults(fields):
             out.append(f"поле {k} пустое — пустое поле это не «нет данных», "
                        f"а «данные были и потерялись при разборе»")
     st = fields.get("state")
-    if st is not None and st.value not in ("waiting", "done"):
-        out.append(f"state: {st.value!r} — состояний два, waiting и done; третьего нет")
+    if st is not None and st.value not in ("waiting", "taken", "done"):
+        out.append(f"state: {st.value!r} — состояния три: waiting, taken, done")
+    if st is not None and st.value == "taken" and "taken_because" not in fields:
+        out.append("state: taken без taken_because — запись без причины не "
+                   "отвечает на вопрос, ради которого её хранят")
     for k in ("review_by", "stamped_at"):
         f = fields.get(k)
         if f is not None and day(f) is None:
@@ -509,7 +514,7 @@ def sort_key(row):
 
 
 GROUPS = ("созрело", "молчит", "недостижима", "ни разу не опрошена",
-          "недооформленные", "данные протухли")
+          "недооформленные", "данные протухли", "взята в работу")
 
 
 def cache_of(row):
@@ -825,6 +830,86 @@ def set_fields(path, pairs):
     os.replace(tmp, path)
 
 
+def field_or(row, key, default):
+    f = row.fields.get(key)
+    return f.value if f is not None else default
+
+
+def iso_ts(s):
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def faults_digest(row):
+    """Отпечаток СОСТАВА причин брака — ключ квитанции класса «форма» (Р9).
+
+    У формы нет начала серии во времени: она не событие, а состояние. Ключом
+    служит сам набор причин. Сменился набор — квитанция сброшена, строка снова в
+    дельте; иначе `ack` гасил бы и НОВУЮ дыру, появившуюся после квитанции.
+    """
+    why = [row.error] if row.error else sorted(row.faults)
+    return hashlib.sha256("\n".join(why).encode("utf-8")).hexdigest()[:8]
+
+
+def reasons(row, c, today, now):
+    """Почему строка в дельте. Список пар (класс, ключ); пусто — не в дельте.
+
+    Классов может быть несколько разом, и `ack` гасит их ВСЕ (Р11). `silent` в
+    дельту не идёт никогда: честно молчащая проба и есть нормальное ожидание, а
+    тревога по ней — та же ложь, что и молчание, только с другой стороны.
+    """
+    out = []
+    if state_of(row) in ("done", "taken"):
+        return out          # снятая не будит, взятая в работу — тоже
+    if row.error or row.faults:
+        out.append(("форма", faults_digest(row)))
+    if c is not None:
+        outcome, since = c.get("outcome"), (c.get("since") or "")
+        if outcome == "fired":
+            out.append(("fired", since))
+        elif outcome == "unreachable":
+            began = iso_ts(since)
+            # Дольше суток (укус 10). Свежая недостижимость — это ssh, который
+            # мигнул; дельта на каждый мигающий ssh обесценила бы дельту.
+            if began is not None and now - began > STALE_UNREACHABLE_S:
+                out.append(("unreachable", since))
+    rb = day(row.fields.get("review_by"))
+    if rb is not None and rb <= today:
+        out.append(("срок", rb.isoformat()))
+    return out
+
+
+def ack_key(kinds):
+    """Ключ квитанции — отпечаток ВСЕГО нынешнего состава причин, кроме срока.
+
+    Квитанция гасит состояние, а не отдельную причину (Р11): любое изменение
+    состава — новый исход вместо прежнего, добавившаяся дыра формы — даёт другой
+    ключ, и строка снова в дельте. «Переход unreachable → fired печатается»
+    выполняется отсюда даром.
+
+    Срок в ключ НЕ входит: его гасит пере-штамп `review_by`, и следующее
+    созревание по сроку — это следующая дата, сама себе ключ. Включи его — и
+    пере-штамп сразу после квитанции изменил бы состав, то есть строка печаталась
+    бы снова тем же вечером.
+    """
+    body = "\n".join(f"{k}={s}" for k, s in sorted(kinds) if k != "срок")
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
+
+
+def unacked(row, kinds):
+    """Есть ли среди причин хоть одна НЕОТРАБОТАННАЯ."""
+    if not kinds:
+        return False
+    if any(k == "срок" for k, _ in kinds):
+        # Срок снова прошёл — значит это новое созревание, а не то же самое:
+        # квитанция по сроку выражается пере-штампом, и он бы его отодвинул.
+        return True
+    a = row.fields.get("acked_key")
+    return not (a is not None and a.value == ack_key(kinds))
+
+
 def cmd_done(a):
     row = resolve(a.id, scan())
     if row.error:
@@ -869,6 +954,71 @@ def cmd_stamp(a):
     return 0
 
 
+def cmd_taken(a):
+    """Работа началась и НЕ кончилась (решение владельца 11.09.2026).
+
+    `ack` («видел, ждём дальше») этого не описывает, `done` («ждать кончили»)
+    лжёт о завершённости. Строка в `taken` не будит и в дельту не идёт, но из
+    `list` не исчезает: работа видна, пока не закрыта.
+
+    Р23: `done`-строка принимается. Это исправление ошибочного закрытия, а не
+    воскрешение, и надгробие при переводе СОХРАНЯЕТСЯ — его писал человек своим
+    словом, а стереть значит спрятать, что строку однажды закрыли.
+    """
+    row = resolve(a.id, scan())
+    if row.error:
+        die(1, f"{row.id}: франтматтер не разбирается ({row.error}) — "
+               f"машина в такой файл не пишет; почини форму и повтори")
+    if not a.because.strip():
+        die(1, "запись без причины не отвечает на вопрос, ради которого её "
+               "хранят: чем именно началась работа и по какому событию")
+    set_fields(row.path, [
+        ("state", "taken"),
+        ("taken_at", datetime.now().date().isoformat()),
+        ("taken_because", yaml_quote(a.because)),
+    ])
+    print(f"взята в работу: {row.id} — {a.because}")
+    return 0
+
+
+def cmd_ack(a):
+    """Квитанция: гасит ВСЕ нынешние причины созревания разом (Р11).
+
+    🔴 Квитанцию ставит ВЛАДЕЛЕЦ, не ассистент. Существует полностью
+    «корректный» прогон, где ассистент прочитал дельту, не назвал её человеку и
+    погасил — строка исчезает навсегда при ненаступившей отработке. Механически
+    это не удержать (сторож дороже сторожимого), поэтому правило сказано вслух
+    и повторяется в выводе `wake`.
+    """
+    row = resolve(a.id, scan())
+    if row.error:
+        # Непарсящаяся строка гасится только руками: машина не пишет в то, чего
+        # не разобрала (инвариант 7). Она будет в дельте каждый старт — это
+        # самый громкий класс, и починить его может только человек.
+        die(1, f"{row.id}: франтматтер не разбирается ({row.error}) — "
+               f"квитанцию машина в такой файл не пишет; почини форму")
+    today = datetime.now().date()
+    kinds = reasons(row, cache_of(row), today, time.time())
+    if not kinds:
+        print(f"{row.id}: гасить нечего — строка в дельту не идёт")
+        return 0
+    pairs, closed = [], [k for k, _ in kinds]
+    if "срок" in closed:
+        probe = row.fields.get("probe")
+        days = (DAYS_NO_PROBE if probe is not None and probe.value == "none"
+                else DAYS_WITH_PROBE)
+        when = today + timedelta(days=days)
+        pairs += [("review_by", when.isoformat()), ("stamped_at", today.isoformat())]
+    pairs += [("acked_at", today.isoformat()),
+              ("acked_outcome", "+".join(sorted(closed))),
+              ("acked_key", ack_key(kinds))]
+    set_fields(row.path, pairs)
+    print(f"{row.id}: квитанция — закрыто «{'+'.join(sorted(closed))}»")
+    if "срок" in closed:
+        print(f"  срок пересмотра переклеен на {pairs[0][1]}")
+    return 0
+
+
 def classify(row, today, now):
     """Группа строки. Созрелость ВЫЧИСЛЯЕТСЯ (инвариант 2), не хранится.
 
@@ -880,6 +1030,12 @@ def classify(row, today, now):
     """
     if row.error or row.faults:
         return "недооформленные"
+    if state_of(row) == "taken":
+        # Р8: своя группа, последняя в порядке печати. Печатать её в вычисленной
+        # группе значило бы поставить строку с прошедшим сроком в «созрело» — то
+        # есть просить действия по работе, которая уже идёт. Форма проверяется
+        # РАНЬШЕ: недооформленная взятая строка громче, чем взятая.
+        return "взята в работу"
     rb = day(row.fields.get("review_by"))
     if rb is not None and rb <= today:
         return "созрело"
@@ -922,6 +1078,16 @@ def line_of(row, group):
     if state_of(row) == "done":
         why = row.fields.get("closed_because")
         marks.insert(0, "снята: " + (why.value if why else "причина не названа"))
+    if state_of(row) == "taken":
+        why = row.fields.get("taken_because")
+        marks.insert(0, "взята в работу: " +
+                     (why.value if why else "причина не названа"))
+        # Р23: строка, закрытая по ошибке и переведённая в taken, СОХРАНЯЕТ
+        # надгробие. Стереть его значило бы спрятать, что строку однажды
+        # закрыли, — а писал его человек своим словом.
+        was = row.fields.get("closed_at")
+        if was is not None:
+            marks.append(f"закрывалась {was.value}, закрытие отменено")
     out = [head + (("   [" + " · ".join(marks) + "]") if marks else "")]
     if group == "недооформленные":
         for why in ([row.error] if row.error else row.faults):
@@ -1077,6 +1243,15 @@ def main(argv=None):
 
     p_probe = sub.add_parser("probe", help="опросить строки (зовётся фоном)")
     p_probe.set_defaults(fn=cmd_probe)
+
+    p_taken = sub.add_parser("taken", help="работа началась и не кончилась")
+    p_taken.add_argument("id", help="<repo-id>/YYYYMMDD-NN либо голый YYYYMMDD-NN")
+    p_taken.add_argument("because", help="чем началась работа — обязательно")
+    p_taken.set_defaults(fn=cmd_taken)
+
+    p_ack = sub.add_parser("ack", help="квитанция: видел, ждём дальше")
+    p_ack.add_argument("id", help="<repo-id>/YYYYMMDD-NN либо голый YYYYMMDD-NN")
+    p_ack.set_defaults(fn=cmd_ack)
 
     a = ap.parse_args(argv)
     return a.fn(a)
