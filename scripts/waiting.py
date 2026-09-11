@@ -567,34 +567,141 @@ def cache_of(row):
     return c if isinstance(c, dict) else None
 
 
+def lock_mark():
+    return LOCK / "owner.json"
+
+
+def mark_lock(token):
+    """Кладёт маркер владельца ВНУТРЬ взятого замка."""
+    try:
+        write_json(lock_mark(), {"token": token, "pid": os.getpid(),
+                                 "at": time.time()})
+        return True
+    except OSError:
+        return False
+
+
+def lock_is_ours(token):
+    """Замок всё ещё наш? Нечитаемый маркер — «не наш», и это верная сторона
+    промаха: чужой замок переживёт лишние 900 с, свой — снимет TTL."""
+    try:
+        m = json.loads(lock_mark().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(m, dict) and m.get("token") == token
+
+
+def drop_lock_dir():
+    """Сносит каталог замка ВМЕСТЕ с содержимым.
+
+    С появлением маркера каталог перестал быть пустым, а `rmdir` по непустому
+    отказывает. Без сноса содержимого протухший замок не снялся бы НИКОГДА: не
+    опрашивалась бы ни одна строка, и снаружи это выглядит как «все молчат».
+    """
+    try:
+        for f in LOCK.iterdir():
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        LOCK.rmdir()
+        return True
+    except OSError:
+        return False
+
+
+def release_lock(token):
+    """Снимает ТОЛЬКО свой замок.
+
+    🔴 Безусловный `rmdir` снимал и ЧУЖОЙ — только что взятый тем, кто снял
+    протухший: A берёт замок → замок протухает (30 недостижимых строк по 30 с
+    потолка = ровно LOCK_TTL_S) → B снимает протухший и берёт свой → A доходит
+    до своего finally и удаляет замок B → C входит третьим. Дальше два прогона
+    пишут кэш вперемешку, и замок, который должен был быть экономией на ssh,
+    перестаёт быть даже ею.
+    """
+    if token is None or not lock_is_ours(token):
+        return False
+    return drop_lock_dir()
+
+
+def seen_path(row):
+    return CACHE / row.box.repo_id / f"{row.name}.seen.json"
+
+
+def seen_of(row):
+    """Квитанция ДЕЛЬТЫ: что именно `wake` про эту строку НАПЕЧАТАЛ.
+
+    🔴 Ради чего заведена. `wake` печатает дельту и ТУТ ЖЕ отцепляет фон —
+    именно потому, что кэш устарел, то есть ровно в тот момент, когда дельту и
+    читают. Пока владелец читает «недостижима» и говорит `ack`, фон успевает
+    записать `fired`. Ключуясь НЫНЕШНИМ составом причин, `ack` гасил бы `fired`,
+    которого не печатал никто, — и сработавшая проба, то самое событие, ради
+    которого реестр существует, терялась бы молча и навсегда.
+
+    Разрез по файлам с одним писателем сохранён: `<id>.json` пишет только
+    `probe`, `<id>.seen.json` — только `wake`. Цена названа вслух: `wake`
+    перестал быть только-читателем, и эта граница проверена кругом критики.
+
+    Форма:
+        {"key":   "<ack_key напечатанного состава>",
+         "kinds": ["форма", "fired"],
+         "at":    "ISO — когда дельта это напечатала"}
+    Нечитаемая или бессоставная квитанция — как её отсутствие: `ack` гасит по
+    нынешнему составу, как до починки. Соврать в сторону «ничего не печатали»
+    тут безопасно, в обратную — нет.
+    """
+    try:
+        s = json.loads(seen_path(row).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(s, dict) or not isinstance(s.get("key"), str):
+        return None
+    kinds = s.get("kinds")
+    if not isinstance(kinds, list) or not kinds:
+        return None
+    if not all(isinstance(k, str) for k in kinds):
+        return None
+    return s
+
+
 def take_lock():
-    """Замок пробы. Возвращает (взят ли, снят ли протухший).
+    """Замок пробы. Возвращает (взят ли, снят ли протухший, жетон владельца).
 
     Замок — экономия на ssh, а НЕ условие корректности: корректность держится
     разрезом кэша по файлам с одним писателем каждый. Нужен затем, чтобы шесть
     сессий, стартовавших в одну минуту, не позвали ssh шесть раз.
+
+    Жетон отдаётся наружу, потому что снимать замок имеет право только тот, кто
+    его взял, — см. release_lock.
     """
     CACHE.mkdir(parents=True, exist_ok=True)
+    # Жетон, а не голый pid: номера процессов система переиспользует, и прогон,
+    # стартовавший под номером давно умершего держателя, снял бы чужой замок
+    # «как свой» — то есть маркер владельца не защищал бы ни от чего.
+    token = f"{os.getpid()}-{time.time_ns()}-{os.urandom(4).hex()}"
     try:
         LOCK.mkdir(parents=True)
-        return True, False
     except FileExistsError:
         pass
+    else:
+        return (True, False, token) if mark_lock(token) else (False, False, None)
     try:
         age = time.time() - LOCK.stat().st_mtime
     except OSError:
-        return False, False
+        return False, False, None
     if age <= LOCK_TTL_S:
-        return False, False
+        return False, False, None
     # Держатель не дожил до снятия. Проба, попросившая пароль, висит без TTY и
     # держала бы замок до его TTL — тогда не опросилась бы НИ ОДНА строка, а
     # снаружи это выглядит как «все молчат».
+    if not drop_lock_dir():
+        return False, False, None
     try:
-        LOCK.rmdir()
         LOCK.mkdir()
     except OSError:
-        return False, False      # успел другой: это его очередь, а не ошибка
-    return True, True
+        return False, False, None    # успел другой: это его очередь, а не ошибка
+    return (True, True, token) if mark_lock(token) else (False, False, None)
 
 
 def write_json(path, obj):
@@ -730,7 +837,7 @@ def cmd_probe(a):
     спросить; он отделён от 0 намеренно, иначе возвращается ровно тот дефект,
     ради которого написан инвариант 3.
     """
-    ok, broken = take_lock()
+    ok, broken, token = take_lock()
     if not ok:
         print("замок занят — фоновая проба уже идёт")
         return 3
@@ -766,10 +873,8 @@ def cmd_probe(a):
             "stale_lock_broken": broken,
         })
     finally:
-        try:
-            LOCK.rmdir()
-        except OSError:
-            pass
+        # Снимаем ТОЛЬКО свой замок — почему именно так, см. release_lock.
+        release_lock(token)
     if broken:
         print("снят протухший замок пробы — предыдущий прогон не дожил до конца")
     return 4 if bad else 0
@@ -876,6 +981,21 @@ def wake():
         # 🔴 Ноль байт. Не «событий нет», не пустая строка, не заголовок без
         # содержимого: требование стоит токенов на каждом из шести стартов.
         return 0
+    # 🔴 Квитанция дельты пишется ПОСЛЕ решения, что печатать, и только для тех
+    # строк, которые печатаются. Отказ глотается целиком: по Р16 `wake` не имеет
+    # права упасть, а упавший здесь оставил бы контекст вообще без дельты —
+    # хуже, чем `ack` по нынешнему составу. `except Exception` тут безопасен:
+    # ни одна из этих трёх строк не зовёт die(), чей SystemExit мимо него и
+    # проехал бы (Ruling 10). Зачем всё это — см. seen_of.
+    for row, kinds, _c in items:
+        try:
+            p = seen_path(row)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            write_json(p, {"key": ack_key(kinds),
+                           "kinds": sorted({k for k, _ in kinds}),
+                           "at": datetime.now().isoformat(timespec="seconds")})
+        except Exception:
+            pass
     lines = ["РЕЕСТР НЕ-СЕЙЧАС-РАБОТЫ — дельта на старте сессии."]
     if broken:
         lines.append(f"🔴 реестр молчит: {broken}")
@@ -1152,7 +1272,10 @@ def set_fields(path, pairs):
         end += 1
     # Запись атомарная: write_text усекает файл ДО записи, и обрыв посередине
     # оставил бы от строки, купленной боем, половину — без резервной копии.
-    tmp = path.with_name(path.name + ".tmp")
+    # Имя временного файла НЕСЁТ pid — тот же класс, что починен в write_json и
+    # install_hook. Писатели здесь — команды, которые зовёт человек, поэтому окно
+    # уже; но класс тот же, а цена промаха выше: это файл ЧЕЛОВЕКА, а не кэш.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(eol.join(lines) + eol, encoding="utf-8", newline="")
     os.replace(tmp, path)
 
@@ -1332,11 +1455,22 @@ def cmd_ack(a):
         die(1, f"{row.id}: франтматтер не разбирается ({row.error}) — "
                f"квитанцию машина в такой файл не пишет; почини форму")
     today = datetime.now().date()
-    kinds = reasons(row, cache_of(row), today, time.time())
+    # 🔴 Гасим то, что дельта НАПЕЧАТАЛА, а не то, что в реестре сейчас. Между
+    # печатью и словом «ack» фон успевает сменить исход — и именно тогда, когда
+    # кэш устарел, то есть в тот же момент, когда дельту и читают. Квитанции нет
+    # (дельта эту строку не печатала, либо файл нечитаем) — работаем по нынешнему
+    # составу, ровно как до починки. Подробности и форма — в seen_of.
+    seen = seen_of(row)
+    if seen is None:
+        kinds = reasons(row, cache_of(row), today, time.time())
+        closed, key = sorted({k for k, _ in kinds}), ack_key(kinds)
+    else:
+        closed, key = sorted(set(seen["kinds"])), seen["key"]
+        kinds = closed
     if not kinds:
         print(f"{row.id}: гасить нечего — строка в дельту не идёт")
         return 0
-    pairs, closed = [], [k for k, _ in kinds]
+    pairs = []
     if "срок" in closed:
         probe = row.fields.get("probe")
         days = (DAYS_NO_PROBE if probe is not None and probe.value == "none"
@@ -1344,10 +1478,17 @@ def cmd_ack(a):
         when = today + timedelta(days=days)
         pairs += [("review_by", when.isoformat()), ("stamped_at", today.isoformat())]
     pairs += [("acked_at", today.isoformat()),
-              ("acked_outcome", "+".join(sorted(closed))),
-              ("acked_key", ack_key(kinds))]
+              ("acked_outcome", "+".join(closed)),
+              ("acked_key", key)]
     set_fields(row.path, pairs)
-    print(f"{row.id}: квитанция — закрыто «{'+'.join(sorted(closed))}»")
+    if seen is not None:
+        # Квитанция дельты израсходована. Оставленная, она заглушила бы БУДУЩЕЕ
+        # событие: следующий `ack` погасил бы по ключу позавчерашней печати.
+        try:
+            seen_path(row).unlink()
+        except OSError:
+            pass
+    print(f"{row.id}: квитанция — закрыто «{'+'.join(closed)}»")
     if "срок" in closed:
         print(f"  срок пересмотра переклеен на {pairs[0][1]}")
     return 0
