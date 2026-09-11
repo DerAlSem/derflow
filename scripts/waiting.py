@@ -9,6 +9,7 @@
     waiting.py taken <id> "<почему>"
     waiting.py ack <id>
     waiting.py wake
+    waiting.py doctor [--install]
 
 Строка — файл `<repo>/.claude/waiting/YYYYMMDD-NN.md` ОСНОВНОГО чекаута,
 беспроектная — `~/.claude/waiting/`. У файла один писатель, и это человек:
@@ -68,6 +69,27 @@ STALE_UNREACHABLE_S = 86400      # «недостижима дольше сут�
 # Стенд обязан работать без сети: иначе укус про код 255 либо не воспроизводится,
 # либо стучится в живой mprz.
 SSH = os.environ.get("WAITING_SSH") or "ssh"
+SETTINGS = HOME / "settings.json"
+HOOK_ANCHOR = '"hooks": {'       # единственная строка верхнего уровня
+HOOK_MARK = "waiting.py wake"    # по чему узнаём свою запись
+# Матчер — Р3: `compact` не включён (длинная сессия платила бы за дельту
+# многократно), `clear` включён (/clear вытирает контекст вместе с доставленной
+# дельтой), `resume` включён (между смертью и возобновлением проходят часы, и
+# дубль дешевле пропуска). timeout: 5 — как у соседей по файлу. $HOME
+# разворачивает харнесс: соседняя запись context-meter.py работает именно так.
+HOOK_BLOCK = """    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/scripts/waiting.py wake",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+"""
 
 
 def die(code, msg):
@@ -852,6 +874,108 @@ def cmd_wake(a):
         return 0
 
 
+def hook_state():
+    """Жива ли запись хука. Возвращает (текст, здорово ли)."""
+    try:
+        raw = SETTINGS.read_text(encoding="utf-8")
+    except OSError as e:
+        return f"настройки не читаются — {e}", False
+    if HOOK_MARK in raw:
+        return "запись хука SessionStart на месте", True
+    return ("записи хука SessionStart НЕТ — реестр не будит никого, и молчащий "
+            "реестр неотличим от пустого. Поставить: waiting.py doctor --install"), False
+
+
+def install_hook():
+    """Текстовая вставка ПО ЯКОРЮ (Р5). Никогда json.load → json.dump.
+
+    Сериализация переписала бы файл целиком и затёрла главу сестринской сессии
+    молча, без конфликта git, — то есть воспроизвела бы в собственном инструменте
+    дефект №3 из «Задачи» спеки, ради которого реестр и пишется. Здесь
+    вставляется одна строка после якоря; всё остальное остаётся байт в байт.
+
+    Якорь не единственный — ОТКАЗ, а не вставка наугад: так же отказывает
+    hand.sh на нескольких хендоффах ветки, потому что угадать хуже, чем не
+    двигаться.
+    """
+    try:
+        raw = SETTINGS.read_text(encoding="utf-8", newline="")
+    except OSError as e:
+        die(2, f"настройки не читаются — {e}")
+    if HOOK_MARK in raw:
+        print("запись хука уже на месте — ничего не меняю")
+        return 0
+    eol = "\r\n" if "\r\n" in raw else "\n"
+    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in raw.split("\n")]
+    hits = [i for i, ln in enumerate(lines) if ln.strip() == HOOK_ANCHOR]
+    if len(hits) != 1:
+        die(2, f"якорь {HOOK_ANCHOR!r} в {SETTINGS} найден {len(hits)} раз — "
+               f"вставлять наугад нельзя. Вставить руками сразу после него:\n"
+               f"{HOOK_BLOCK}")
+    at = hits[0] + 1
+    lines[at:at] = HOOK_BLOCK.rstrip("\n").split("\n")
+    tmp = SETTINGS.with_name(SETTINGS.name + ".tmp")
+    tmp.write_text(eol.join(lines), encoding="utf-8", newline="")
+    os.replace(tmp, SETTINGS)
+    print(f"запись хука вставлена в {SETTINGS} — по якорю, чужие ключи не тронуты")
+    print("Проверить: новая сессия, и дельта обязана прийти в её контекст.")
+    return 0
+
+
+def cmd_doctor(a):
+    """Жив ли механизм. Молчащий реестр неотличим от пустого.
+
+    Отдельная команда для ЧЕЛОВЕКА, а не хук: единственный класс, который не
+    виден изнутри дельты, — это отсутствие самой дельты. Поэтому первой строкой
+    называется запись хука, а не состояние кэша.
+
+    Возвращает 2 (конфигурация) при любой найденной поломке. До Задачи 5 это
+    штатное состояние поставки: записи хука ещё нет, и doctor честно кричит.
+    """
+    if a.install:
+        return install_hook()
+    now = time.time()
+    bad = 0
+    text, ok = hook_state()
+    print(("✅ " if ok else "🔴 ") + text)
+    bad += 0 if ok else 1
+    broken = registry_broken(now)
+    if broken:
+        print(f"🔴 {broken}")
+        bad += 1
+    else:
+        try:
+            run = json.loads(RUN.read_text(encoding="utf-8"))
+            print(f"✅ фон отчитался {run.get('finished_at')}: строк "
+                  f"{run.get('rows')}, недостижимых {run.get('unreachable')}")
+        except (OSError, ValueError):
+            print("· фоновых прогонов ещё не было — это не поломка, это старт")
+    if LOCK.is_dir():
+        try:
+            age = int(now - LOCK.stat().st_mtime)
+        except OSError:
+            age = -1
+        print(f"· замок пробы занят {age} с (TTL {LOCK_TTL_S})")
+    same = changed = 0
+    for p in (sorted(CACHE.glob("*/*.json")) if CACHE.is_dir() else []):
+        try:
+            c = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        same += int(c.get("same_truth_runs") or 0)
+        changed += int(c.get("changed_runs") or 0)
+    total = same + changed
+    if total:
+        # Замер TTL (Р13): число выбирается наблюдением, а не оценкой.
+        print(f"замер TTL (CACHE_TTL_S={CACHE_TTL_S}): прогонов {total}, "
+              f"та же правда {same}, смена исхода {changed} — "
+              f"{100 * changed // total}% смен")
+        print("Частое «то же самое» значит TTL тесен, редкая смена — что широк.")
+    else:
+        print("замер TTL: прогонов ещё нет — числу не на чем выбраться")
+    return 2 if bad else 0
+
+
 def vanished(rows):
     """Пропажа из скана — событие, и печатается она ОДИН раз.
 
@@ -1378,6 +1502,11 @@ def main(argv=None):
 
     p_wake = sub.add_parser("wake", help="дельта в контекст (зовётся хуком)")
     p_wake.set_defaults(fn=cmd_wake)
+
+    p_doctor = sub.add_parser("doctor", help="жив ли механизм реестра")
+    p_doctor.add_argument("--install", action="store_true",
+                          help="поставить запись хука SessionStart по якорю")
+    p_doctor.set_defaults(fn=cmd_doctor)
 
     a = ap.parse_args(argv)
     return a.fn(a)

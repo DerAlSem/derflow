@@ -1348,6 +1348,122 @@ sleep 3
 { [ -f "$HC/home/20260909-07.json" ]; }
 is "…и отцепленный фон дожил до записи кэша — start_new_session, а не сирота" $?
 
+echo "=== doctor: своего отсутствия дельта не видит ==="
+
+# Фикстура настроек с ЧУЖИМИ ключами — они обязаны уцелеть байт в байт.
+cat > "$WAITING_HOME/settings.json" <<'SETT'
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Users/x/.claude/scripts/hand.sh:*)"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/context-meter.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "theme": "dark"
+}
+SETT
+before="$(cksum < "$WAITING_HOME/settings.json")"
+
+# Укус 21 спеки, первая половина: doctor краснеет, когда записи нет.
+wt "$WAITING_HOME" doctor
+{ [ "$rc" = 2 ] && has "записи хука SessionStart НЕТ"; }
+is "doctor возвращает 2 и НАЗЫВАЕТ отсутствие записи хука" $?
+{ has "неотличим от пустого"; }
+is "…и говорит, почему это молчание, а не пустота" $?
+
+# Вторая половина: установка ставит и НЕ трогает чужого.
+wt "$WAITING_HOME" doctor --install
+{ [ "$rc" = 0 ] && has "вставлена" \
+    && inf "$WAITING_HOME/settings.json" "waiting.py wake"; }
+is "doctor --install вставил запись — и сказал куда" $?
+{ inf "$WAITING_HOME/settings.json" '"matcher": "startup|resume|clear"'; }
+is "матчер именно startup|resume|clear — compact не включён (Р3)" $?
+# 🔴 «Чужое цело» писал СТЕНД, и на отсутствующем инструменте оно цело даром.
+# Спаяно со своей записью: уцелеть чужому есть смысл только там, где вставка
+# состоялась. Обе половины в одном укусе, положительную даёт только инструмент.
+{ inf "$WAITING_HOME/settings.json" "waiting.py wake" \
+    && inf "$WAITING_HOME/settings.json" "context-meter.py" \
+    && inf "$WAITING_HOME/settings.json" '"theme": "dark"' \
+    && inf "$WAITING_HOME/settings.json" "hand.sh"; }
+is "🔴 запись вставлена, и чужие ключи целы: permissions, сосед и theme" $?
+{ python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+sys.exit(0 if "SessionStart" in d["hooks"] else 1)' "$WAITING_HOME/settings.json"; }
+is "…и файл остался валидным JSON, а запись легла ВНУТРЬ hooks, не рядом" $?
+{ python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+s=d["hooks"]["SessionStart"][0]
+sys.exit(0 if s["hooks"][0]["timeout"]==5 and "wake" in s["hooks"][0]["command"] else 1)' \
+    "$WAITING_HOME/settings.json"; }
+is "…и разбирается именно как SessionStart с потолком 5 с" $?
+
+# Повторная установка — no-op, и она так и говорит.
+after="$(cksum < "$WAITING_HOME/settings.json")"
+wt "$WAITING_HOME" doctor --install
+{ [ "$rc" = 0 ] && has "уже на месте" \
+    && [ "$(cksum < "$WAITING_HOME/settings.json")" = "$after" ]; }
+is "вторая установка ничего не меняет и называет это, а не молчит" $?
+{ [ "$before" != "$after" ]; }
+is "…а первая файл ИЗМЕНИЛА — иначе предыдущий укус зелен на бездействии" $?
+
+# Якорь не единственный — отказ, а не вставка наугад.
+cp "$WAITING_HOME/settings.json" "$ROOT/ok-settings.json"
+python3 - "$WAITING_HOME/settings.json" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+t = p.read_text(encoding="utf-8").replace('"hooks": {', '"hooks": {\n  "hooks": {', 1)
+p.write_text(t.replace("waiting.py wake", "ничего"), encoding="utf-8")
+PY
+wt "$WAITING_HOME" doctor --install
+{ [ "$rc" = 2 ] && has "найден 2 раз" && has "Вставить руками"; }
+is "неоднозначный якорь — отказ кодом 2 с готовым блоком, а не догадка" $?
+cp "$ROOT/ok-settings.json" "$WAITING_HOME/settings.json"
+
+# Укус 20 спеки: два счётчика замера растут ПО-РАЗНОМУ.
+rm -rf "$HB" "$HC"; mkdir -p "$HB"
+prb "$HB" 20260909-21 local /tmp 'echo ничего' 'приёмник'
+wt "$WAITING_HOME" probe
+{ jq -er '.same_truth_runs==0 and .changed_runs==1 and .outcome=="silent"' \
+    "$HC/home/20260909-21.json" >/dev/null; }
+is "первый прогон — смена исхода: счётчик changed, а не same" $?
+s1="$(jq -r '.since' "$HC/home/20260909-21.json")"
+wt "$WAITING_HOME" probe
+{ jq -er '.same_truth_runs==1 and .changed_runs==1' \
+    "$HC/home/20260909-21.json" >/dev/null; }
+is "второй прогон с тем же исходом двигает same и НЕ двигает changed" $?
+# `[ -n "$s1" ]` — не украшение: без него на отсутствующем кэше jq молчит с обеих
+# сторон, и укус сравнивает пустоту с пустотой. Начало серии есть только там, где
+# кэш написан инструментом.
+{ [ -n "$s1" ] && [ "$(jq -r '.since' "$HC/home/20260909-21.json")" = "$s1" ]; }
+is "…и начало серии не сдвинулось: серия та же (ключ водяного знака)" $?
+# `since` пишется с точностью до СЕКУНДЫ, а три прогона укладываются в одну: без
+# паузы новая серия получает байт-в-байт ту же строку, и укус краснеет на верной
+# реализации. В бою пауза между прогонами не меньше TTL (3600 с), так что
+# секундная точность контракта достаточна — чинится стенд, а не формат кэша.
+sleep 1
+prb "$HB" 20260909-21 local /tmp 'echo приёмник' 'приёмник'
+wt "$WAITING_HOME" probe
+{ jq -er '.same_truth_runs==1 and .changed_runs==2 and .outcome=="fired"' \
+    "$HC/home/20260909-21.json" >/dev/null; }
+is "смена исхода двигает changed — и замер различает тесный TTL от широкого" $?
+{ [ "$(jq -r '.since' "$HC/home/20260909-21.json")" != "$s1" ]; }
+is "…и переставляет начало серии: квитанция прежнего исхода сброшена" $?
+wt "$WAITING_HOME" doctor
+{ has "замер TTL (CACHE_TTL_S=3600)" && has "смена исхода 2"; }
+is "doctor печатает замер числами, а не «надо бы посмотреть»" $?
+
 echo
 echo "итог: ✅ $pass   ❌ $fail"
 [ "$fail" = 0 ]
