@@ -601,7 +601,14 @@ def write_json(path, obj):
     """Атомарно. Обрыв посередине оставил бы кэш нечитаемым, а нечитаемый кэш
     честно читается как «ни разу не опрошена» — то есть событие потерялось бы.
     """
-    tmp = path.with_name(path.name + ".tmp")
+    # Имя временного файла НЕСЁТ pid. С общим `<имя>.tmp` два прогона писали бы
+    # в один файл: усечение вторым обрезало бы данные первого, os.replace
+    # публиковал бы смесь, и cache_of честно отвечал бы «ни разу не опрошена»
+    # про строку, которую спрашивали дважды. То есть замок был бы условием
+    # КОРРЕКТНОСТИ, хотя спека и три докстринга подряд обещают обратное —
+    # «корректность держится разрезом кэша по файлам с одним писателем».
+    # Разрез даёт одного писателя на СТРОКУ, а не на временный файл.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1) + "\n",
                    encoding="utf-8")
     os.replace(tmp, path)
@@ -663,8 +670,11 @@ def probe_one(row):
     """
     argv, script = probe_call(row)
     try:
+        # errors="replace": живые пробы — грепы по журналу, а в журнале бывает
+        # один битый байт. Строгий разбор бросил бы UnicodeDecodeError, которого
+        # нет ни в одном except ниже, и прогон умер бы на этой строке молча.
         p = subprocess.run(argv, input=script, capture_output=True, text=True,
-                           timeout=PROBE_TIMEOUT_S)
+                           errors="replace", timeout=PROBE_TIMEOUT_S)
     except (FileNotFoundError, PermissionError) as e:
         return "unreachable", 127, f"нечем спросить — {e}"
     except subprocess.TimeoutExpired:
@@ -729,8 +739,21 @@ def cmd_probe(a):
     try:
         rows = [r for r in scan() if probeable(r)]
         for row in rows:
-            outcome, probe_rc, note = probe_one(row)
-            write_cache(row, outcome, probe_rc, note)
+            try:
+                outcome, probe_rc, note = probe_one(row)
+                write_cache(row, outcome, probe_rc, note)
+            except Exception as e:
+                # Одна строка не смеет уносить ВЕСЬ прогон. Без этого отказ на
+                # первой же строке оставлял бы последующие неопрошенными и не
+                # писал бы квитанцию прогона — «не смогла спросить» у одной
+                # превращалось бы в «не спрашивали» у всех остальных, то есть в
+                # конфляцию инварианта 3 там, где он и охраняется. Фон отцеплен,
+                # stderr в /dev/null: трейсбека не увидел бы никто.
+                outcome, probe_rc, note = "unreachable", 1, f"проба сорвалась — {e}"
+                try:
+                    write_cache(row, outcome, probe_rc, note)
+                except OSError:
+                    pass
             if outcome == "unreachable":
                 bad += 1
             print(f"{row.id}: {outcome}" + (f" — {note}" if note else ""))
@@ -769,8 +792,15 @@ def detach_probe():
         pass        # не вышло отцепить — это не повод ронять старт сессии
 
 
-def registry_broken(now):
+def registry_broken(now, watching=True):
     """Молчание реестра — само событие. Возвращает текст или None.
+
+    `watching` — есть ли в реестре хоть одна строка, которую фон обязан
+    спрашивать. Если нет (все `probe: none`, `taken` либо `done` — после
+    миграции это норма), фон не зовётся вовсе и квитанция прогона стареет сама
+    собой. Без этой развилки каждый старт любой сессии получал бы «реестр
+    молчит» НАВСЕГДА, погасить это нечем, и единственная строка, которой
+    позволено нарушить «пустая дельта пуста», обесценилась бы первой же неделей.
 
     Если проба падает при старте, кэш просто перестаёт обновляться: исходы
     остаются прежними, дельта пуста, `list` печатает вчерашнюю правду. Молчащий
@@ -793,7 +823,7 @@ def registry_broken(now):
     ts = run.get("finished_at_ts")
     if not isinstance(ts, (int, float)):
         return "квитанция фонового прогона без времени — фон писал её сломанным"
-    if now - ts > 3 * CACHE_TTL_S:
+    if watching and now - ts > 3 * CACHE_TTL_S:
         return (f"фоновая проба не отчитывалась {int((now - ts) / 3600)} ч — "
                 f"реестр печатает вчерашнюю правду")
     return None
@@ -828,17 +858,18 @@ def wake():
     """
     today = datetime.now().date()
     now = time.time()
-    items, stale = [], False
+    items, stale, watching = [], False, False
     for row in scan():
         c = cache_of(row)
         kinds = reasons(row, c, today, now)
         if kinds and unacked(row, kinds):
             items.append((row, kinds, c))
         if probeable(row):
+            watching = True
             ts = (c or {}).get("last_run_at_ts")
             if not isinstance(ts, (int, float)) or now - ts > CACHE_TTL_S:
                 stale = True
-    broken = registry_broken(now)
+    broken = registry_broken(now, watching)
     if stale:
         detach_probe()
     if not items and not broken:
@@ -868,20 +899,60 @@ def cmd_wake(a):
     всегда нуль и поэтому ловится всё: сломанный кэш, уехавший корень, чужой
     файл в ящике. Ни одно из этого не стоит отказа старта.
     """
+    # stderr уводится в никуда на время прогона. Одного кода 0 мало: `die()`
+    # успевает НАПЕЧАТАТЬ причину до того, как бросит SystemExit, и требование
+    # спеки «падение = ноль ВЫВОДА» нарушается вторым потоком, а не первым.
+    # Поймано укусом, а не чтением кода: первая редакция починки давала код 0 и
+    # строку на stderr. Дельта идёт в stdout и уходит наружу как прежде.
+    saved, sys.stderr = sys.stderr, open(os.devnull, "w", encoding="utf-8")
     try:
         return wake()
-    except Exception:
+    except (Exception, SystemExit):
+        # 🔴 SystemExit НЕ наследник Exception — он от BaseException. Голый
+        # `except Exception` пропускал наружу ровно тот класс, ради которого
+        # написан: die() бросает SystemExit, и путь wake → scan → boxes →
+        # roots() → die(2) выводил хук кодом 2 с текстом на stderr НА КАЖДОМ
+        # старте любой сессии. Вход не экзотический: файл корней, где все строки
+        # закомментированы, — штатное конфигурационное состояние, и стенд сам
+        # его строит. Второй такой путь — git вне PATH у процесса хука.
+        # KeyboardInterrupt намеренно НЕ ловится: прерывание человеком не отказ.
         return 0
+    finally:
+        sys.stderr.close()
+        sys.stderr = saved
 
 
 def hook_state():
-    """Жива ли запись хука. Возвращает (текст, здорово ли)."""
+    """Жива ли запись хука. Возвращает (текст, здорово ли).
+
+    🔴 Судим РАЗБОРОМ, а не грепом по тексту. Подстрока «waiting.py wake» живёт
+    и в `permissions.allow` (такие записи в этом файле уже есть), и во ВТОРОМ
+    одноимённом ключе `SessionStart`, который разбор молча выбрасывает. Зелёный
+    `doctor` при мёртвом хуке — это «молчащий реестр неотличим от пустого»,
+    воспроизведённое в самом стороже, а `doctor` тут единственный сторож:
+    своего отсутствия дельта не видит по построению.
+
+    Читаем разбором, ПИШЕМ по-прежнему по якорю: инвариант 7 про запись.
+    """
     try:
         raw = SETTINGS.read_text(encoding="utf-8")
     except OSError as e:
         return f"настройки не читаются — {e}", False
-    if HOOK_MARK in raw:
+    try:
+        d = json.loads(raw)
+    except ValueError as e:
+        return (f"настройки не разбираются как JSON ({e}) — харнесс игнорирует "
+                f"файл ЦЕЛИКОМ, и ни одного хука сейчас нет"), False
+    blocks = d.get("hooks", {}).get("SessionStart") or [] if isinstance(d, dict) else []
+    live = any(HOOK_MARK in (h.get("command") or "")
+               for b in blocks if isinstance(b, dict)
+               for h in (b.get("hooks") or []) if isinstance(h, dict))
+    if live:
         return "запись хука SessionStart на месте", True
+    if HOOK_MARK in raw:
+        return ("команда wake в настройках упомянута, но НЕ в живом блоке "
+                "SessionStart — хук не зовётся никем, а греп по файлу сказал бы "
+                "«на месте». Разобрать руками, куда она попала"), False
     return ("записи хука SessionStart НЕТ — реестр не будит никого, и молчащий "
             "реестр неотличим от пустого. Поставить: waiting.py doctor --install"), False
 
@@ -905,6 +976,15 @@ def install_hook():
     if HOOK_MARK in raw:
         print("запись хука уже на месте — ничего не меняю")
         return 0
+    if '"SessionStart"' in raw:
+        # Вставка первым ключом после якоря дала бы ВТОРОЙ одноимённый ключ, а
+        # разбор оставляет последний: наш хук молча не работал бы, и doctor
+        # по-прежнему говорил бы «на месте». Это тот самый дефект №3 из «Задачи»
+        # спеки — затирание чужой главы, только не байтами, а дублем ключа.
+        die(2, f"в {SETTINGS} уже есть ключ SessionStart, а нашей записи в нём "
+               f"нет. Вставлять нельзя: два одноимённых ключа — это молча "
+               f"выключенный хук. Вписать команду руками в СУЩЕСТВУЮЩИЙ блок:\n"
+               f'            "command": "python3 $HOME/.claude/scripts/waiting.py wake",')
     eol = "\r\n" if "\r\n" in raw else "\n"
     lines = [ln[:-1] if ln.endswith("\r") else ln for ln in raw.split("\n")]
     hits = [i for i, ln in enumerate(lines) if ln.strip() == HOOK_ANCHOR]
@@ -914,7 +994,7 @@ def install_hook():
                f"{HOOK_BLOCK}")
     at = hits[0] + 1
     lines[at:at] = HOOK_BLOCK.rstrip("\n").split("\n")
-    tmp = SETTINGS.with_name(SETTINGS.name + ".tmp")
+    tmp = SETTINGS.with_name(f"{SETTINGS.name}.{os.getpid()}.tmp")   # pid: файл правят 4–6 сессий
     tmp.write_text(eol.join(lines), encoding="utf-8", newline="")
     os.replace(tmp, SETTINGS)
     print(f"запись хука вставлена в {SETTINGS} — по якорю, чужие ключи не тронуты")
@@ -939,7 +1019,7 @@ def cmd_doctor(a):
     text, ok = hook_state()
     print(("✅ " if ok else "🔴 ") + text)
     bad += 0 if ok else 1
-    broken = registry_broken(now)
+    broken = registry_broken(now, any(probeable(r) for r in scan()))
     if broken:
         print(f"🔴 {broken}")
         bad += 1
@@ -1108,10 +1188,17 @@ def reasons(row, c, today, now):
     тревога по ней — та же ложь, что и молчание, только с другой стороны.
     """
     out = []
-    if state_of(row) in ("done", "taken"):
-        return out          # снятая не будит, взятая в работу — тоже
+    # 🔴 Форма РАНЬШЕ состояния — тот же порядок, что в classify, и по той же
+    # причине (Р8: недооформленная взятая строка громче, чем взятая). У
+    # НЕПАРСЯЩЕЙСЯ он вдобавок единственно возможный: её `state` прочитан из
+    # полей, набранных ДО ошибки, и «снята» из такого файла недостоверна.
+    # Обратный порядок прятал строку, сломанную руками уже после `taken`, из
+    # дельты НАВСЕГДА — при том что спека требует печатать непарсящуюся ВСЕГДА,
+    # а починить её может только человек, которому про неё никто не скажет.
     if row.error or row.faults:
         out.append(("форма", faults_digest(row)))
+    if state_of(row) in ("done", "taken"):
+        return out          # исхода и срока у снятой и взятой не спрашиваем
     if c is not None:
         outcome, since = c.get("outcome"), (c.get("since") or "")
         if outcome == "fired":
