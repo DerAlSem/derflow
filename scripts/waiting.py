@@ -963,17 +963,43 @@ def wake():
     """
     today = datetime.now().date()
     now = time.time()
-    items, stale, watching = [], False, False
+    items, stale, watching, receipts = [], False, False, []
     for row in scan():
         c = cache_of(row)
         kinds = reasons(row, c, today, now)
-        if kinds and unacked(row, kinds):
+        printed = bool(kinds) and unacked(row, kinds)
+        if printed:
             items.append((row, kinds, c))
+        receipts.append((row, kinds if printed else None))
         if probeable(row):
             watching = True
             ts = (c or {}).get("last_run_at_ts")
             if not isinstance(ts, (int, float)) or now - ts > CACHE_TTL_S:
                 stale = True
+    # 🔴 Квитанция дельты обслуживается для ВСЕХ строк и ДО раннего возврата.
+    # Напечатанной — кладём; НЕ напечатанной — сносим, и вторая половина ничуть
+    # не менее важна первой. Квитанция, которой следующая дельта не подтвердила,
+    # описывает печать позавчерашнего дня; оставленная лежать, она заглушила бы
+    # будущее событие ровно так же, как неизрасходованная после `ack`. Поймано
+    # укусом, а не чтением кода: стенд от этого КРАСНЕЛ ЧЕРЕЗ РАЗ — девять чисел
+    # таблицы разошлись, и разбор расхождения вывел сюда.
+    #
+    # Отказ глотается целиком: по Р16 `wake` не имеет права упасть, а упавший
+    # здесь оставил бы контекст вообще без дельты. `except Exception` тут
+    # безопасен — ни одна из этих строк не зовёт die(), чей SystemExit мимо него
+    # и проехал бы (Ruling 10). Зачем всё это — см. seen_of.
+    for row, kinds in receipts:
+        try:
+            p = seen_path(row)
+            if kinds is None:
+                p.unlink(missing_ok=True)
+                continue
+            p.parent.mkdir(parents=True, exist_ok=True)
+            write_json(p, {"key": ack_key(kinds),
+                           "kinds": sorted({k for k, _ in kinds}),
+                           "at": datetime.now().isoformat(timespec="seconds")})
+        except Exception:
+            pass
     broken = registry_broken(now, watching)
     if stale:
         detach_probe()
@@ -981,21 +1007,6 @@ def wake():
         # 🔴 Ноль байт. Не «событий нет», не пустая строка, не заголовок без
         # содержимого: требование стоит токенов на каждом из шести стартов.
         return 0
-    # 🔴 Квитанция дельты пишется ПОСЛЕ решения, что печатать, и только для тех
-    # строк, которые печатаются. Отказ глотается целиком: по Р16 `wake` не имеет
-    # права упасть, а упавший здесь оставил бы контекст вообще без дельты —
-    # хуже, чем `ack` по нынешнему составу. `except Exception` тут безопасен:
-    # ни одна из этих трёх строк не зовёт die(), чей SystemExit мимо него и
-    # проехал бы (Ruling 10). Зачем всё это — см. seen_of.
-    for row, kinds, _c in items:
-        try:
-            p = seen_path(row)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            write_json(p, {"key": ack_key(kinds),
-                           "kinds": sorted({k for k, _ in kinds}),
-                           "at": datetime.now().isoformat(timespec="seconds")})
-        except Exception:
-            pass
     lines = ["РЕЕСТР НЕ-СЕЙЧАС-РАБОТЫ — дельта на старте сессии."]
     if broken:
         lines.append(f"🔴 реестр молчит: {broken}")
