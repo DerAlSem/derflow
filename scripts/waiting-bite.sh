@@ -1517,7 +1517,7 @@ wt "$WAITING_HOME" doctor --install
     && inf "$WAITING_HOME/settings.json" "waiting.py wake"; }
 is "doctor --install вставил запись — и сказал куда" $?
 { inf "$WAITING_HOME/settings.json" '"matcher": "startup|resume|clear"'; }
-is "матчер именно startup|resume|clear — compact не включён (Р3)" $?
+is "матчер именно startup|resume|clear — compact и fork не включены (Р3)" $?
 # 🔴 «Чужое цело» писал СТЕНД, и на отсутствующем инструменте оно цело даром.
 # Спаяно со своей записью: уцелеть чужому есть смысл только там, где вставка
 # состоялась. Обе половины в одном укусе, положительную даёт только инструмент.
