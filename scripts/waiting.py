@@ -822,6 +822,12 @@ def write_cache(row, outcome, probe_rc, note):
     Рука делает это сама: поле называется «rc», проба вернула «rc».
     """
     old = cache_of(row) or {}
+    # 🔴 Первый прогон — НАЧАЛО наблюдения, а не наблюдение: прежнего исхода не
+    # было, и менять было нечего. Засчитывать его сменой значит завышать долю
+    # смен ровно на одну штуку с КАЖДОЙ заведённой строки — сдвиг растёт с
+    # числом строк, а не со временем, и замер тем лживее, чем больше реестр.
+    # Замерено 11.09 на живом кэше: 39 «смен» при 33 строках, настоящих 6.
+    first = "outcome" not in old
     same = old.get("outcome") == outcome
     now_iso = datetime.now().isoformat(timespec="seconds")
     c = {
@@ -833,8 +839,10 @@ def write_cache(row, outcome, probe_rc, note):
         "last_rc": 0,            # прогон состоялся, чем бы ни кончилась проба
         "probe_rc": probe_rc,
         "note": note,
-        "same_truth_runs": int(old.get("same_truth_runs") or 0) + (1 if same else 0),
-        "changed_runs": int(old.get("changed_runs") or 0) + (0 if same else 1),
+        "same_truth_runs": int(old.get("same_truth_runs") or 0)
+                           + (0 if first else (1 if same else 0)),
+        "changed_runs": int(old.get("changed_runs") or 0)
+                        + (0 if first or same else 1),
     }
     p = CACHE / row.box.repo_id / f"{row.name}.json"
     p.parent.mkdir(parents=True, exist_ok=True)

@@ -1646,12 +1646,20 @@ cp "$ROOT/ok-settings.json" "$WAITING_HOME/settings.json"
 rm -rf "$HB" "$HC"; mkdir -p "$HB"
 prb "$HB" 20260909-21 local /tmp 'echo ничего' 'приёмник'
 wt "$WAITING_HOME" probe
-{ jq -er '.same_truth_runs==0 and .changed_runs==1 and .outcome=="silent"' \
+# 🔴 Первый прогон НЕ наблюдение, а его НАЧАЛО: прежнего исхода не было, и
+# менять было нечего. Считать его сменой значит завышать долю смен ровно на
+# одну штуку с КАЖДОЙ заведённой строки — сдвиг растёт с числом строк, а не со
+# временем, и замер тем лживее, чем больше реестр. Замерено 11.09 на живом
+# кэше: 39 «смен» при 33 строках, из них настоящих 6.
+{ jq -er '.same_truth_runs==0 and .changed_runs==0 and .outcome=="silent"' \
     "$HC/home/20260909-21.json" >/dev/null; }
-is "первый прогон — смена исхода: счётчик changed, а не same" $?
+is "первый прогон не двигает НИ ОДИН счётчик замера — наблюдения ещё нет" $?
+{ [ -n "$(jq -r '.since' "$HC/home/20260909-21.json")" ] \
+    && [ "$(jq -r '.since' "$HC/home/20260909-21.json")" != "null" ]; }
+is "…но серию он открывает: since поставлен, иначе водяной знак пуст" $?
 s1="$(jq -r '.since' "$HC/home/20260909-21.json")"
 wt "$WAITING_HOME" probe
-{ jq -er '.same_truth_runs==1 and .changed_runs==1' \
+{ jq -er '.same_truth_runs==1 and .changed_runs==0' \
     "$HC/home/20260909-21.json" >/dev/null; }
 is "второй прогон с тем же исходом двигает same и НЕ двигает changed" $?
 # `[ -n "$s1" ]` — не украшение: без него на отсутствующем кэше jq молчит с обеих
@@ -1666,14 +1674,22 @@ is "…и начало серии не сдвинулось: серия та ж�
 sleep 1
 prb "$HB" 20260909-21 local /tmp 'echo приёмник' 'приёмник'
 wt "$WAITING_HOME" probe
-{ jq -er '.same_truth_runs==1 and .changed_runs==2 and .outcome=="fired"' \
+{ jq -er '.same_truth_runs==1 and .changed_runs==1 and .outcome=="fired"' \
     "$HC/home/20260909-21.json" >/dev/null; }
 is "смена исхода двигает changed — и замер различает тесный TTL от широкого" $?
 { [ "$(jq -r '.since' "$HC/home/20260909-21.json")" != "$s1" ]; }
 is "…и переставляет начало серии: квитанция прежнего исхода сброшена" $?
 wt "$WAITING_HOME" doctor
-{ has "замер TTL (CACHE_TTL_S=3600)" && has "смена исхода 2"; }
+{ has "замер TTL (CACHE_TTL_S=3600)" && has "смена исхода 1"; }
 is "doctor печатает замер числами, а не «надо бы посмотреть»" $?
+# Сдвиг первого прогона растёт с ЧИСЛОМ СТРОК — ловится только на нескольких.
+# Положительная половина рядом: у той строки, что прогналась дважды, same=1.
+prb "$HB" 20260909-22 local /tmp 'echo ничего' 'приёмник'
+prb "$HB" 20260909-23 local /tmp 'echo ничего' 'приёмник'
+wt "$WAITING_HOME" probe
+wt "$WAITING_HOME" doctor
+{ has "смена исхода 1" && has "та же правда 2"; }
+is "две новых строки НЕ добавили смен: сдвиг не масштабируется с реестром" $?
 
 echo "=== круг критики 11.09: то, чего стенд не ловил ==="
 
