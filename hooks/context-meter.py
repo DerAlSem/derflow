@@ -121,6 +121,52 @@ def ago(sec):
     return f"{sec / 86_400:.0f}д"
 
 
+def loud_msg():
+    """Один текст на оба входа: порог, названный дважды по-разному, — два правила."""
+    return ("‼ расщепи сессию САМ: доведи хендофф до «здесь и сейчас» и позови "
+            "~/.claude/scripts/hand.sh <каталог> (derflow/_capture.md)")
+
+
+def main_tool():
+    """Вход для `PostToolUse`. Печатает порог РОВНО ОДИН РАЗ за сессию.
+
+    🔴 Зачем отдельный вход. `UserPromptSubmit` меряет на РЕПЛИКЕ, а дорожает
+    сессия на ХОДАХ. Замер 12.09.2026, `V·хвосты слияния` (82cae91b): одна
+    человеческая реплика, 404 хода, контекст 55k → 488k, cache-read 113,5M —
+    и метр отработал ровно один раз, на 55k. То есть он слеп именно в том
+    случае, который дороже всего: в длинном автономном прогоне. Последняя треть
+    ходов там стоила 48% счёта.
+
+    Печатается один раз, а не на каждом вызове: сказать 178 раз — это не
+    громче, это фон, который перестают читать. Защёлка — отдельный файл, а не
+    поле в состоянии: `write_state` перезаписывает его целиком на каждой
+    реплике, и поле бы стёрлось.
+    """
+    try:
+        payload = json.load(sys.stdin)
+    except (ValueError, OSError):
+        return 0
+    session = payload.get("session_id")
+    if not session:
+        return 0
+    latch = os.path.join(STATE_DIR, f"{session}.loud")
+    # Дешёвая сторона вперёд: после первого раза хук не читает транскрипт вовсе.
+    if os.path.exists(latch):
+        return 0
+    n = last_context(payload.get("transcript_path") or "")
+    if not n or n < LOUD:
+        return 0
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        os.close(os.open(latch, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+    except FileExistsError:
+        return 0                      # гонка: печатает тот, кто поставил защёлку
+    except OSError:
+        pass                          # защёлку не поставили — лучше дважды, чем ни разу
+    print(f"ctx: {n / 1000:.0f}k {loud_msg()}")
+    return 0
+
+
 def main():
     try:
         payload = json.load(sys.stdin)
@@ -134,7 +180,7 @@ def main():
     if n:
         msg = f"ctx: {n / 1000:.0f}k"
         if n >= LOUD:
-            msg += " ‼ расщепи сессию — передай задачу файлом (derflow/_capture.md)"
+            msg += " " + loud_msg()
         elif n >= WARN:
             msg += " ⚠ дальше каждый ход платит за этот контекст"
         out.append(msg)
@@ -156,4 +202,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main_tool() if "--tool" in sys.argv else main())

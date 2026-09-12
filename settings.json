@@ -51,6 +51,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/context-meter.py --tool",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   },
   "enabledPlugins": {
