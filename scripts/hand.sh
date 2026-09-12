@@ -379,7 +379,9 @@ chmod +x "$launcher"
 if [ "$dry" = 1 ]; then
   echo "launcher: $launcher"
   sed 's/^/    /' "$launcher"
-  echo "команда: open -a Ghostty.app $launcher"
+  # Доставка сменилась (см. разбор ниже) — сухой прогон обязан называть ту, что
+  # действительно исполнится, иначе он врёт ровно о проверяемом месте.
+  echo "доставка: new tab в окне родителя; последний рубеж — open -a Ghostty.app"
   rm -f "$launcher"
   exit 0
 fi
