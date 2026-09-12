@@ -995,6 +995,58 @@ def why_line(kind, key, row, c):
     return f"срок пересмотра {key} прошёл{tail}"
 
 
+def names_repo(text, repo):
+    r"""Называет ли `entry` этот репозиторий. Сверяется ПУТЬ, а не имя.
+
+    Голое имя репозиторий не локализует (тот же довод, что в display_path):
+    корней скана бывает несколько, и одноимённые каталоги под разными корнями —
+    ровно тот класс, ради которого идентификатор сделан глобальным. Формы две,
+    потому что `entry` пишется через display_path (`~/dev/gmb_v2`), но правится
+    и руками.
+
+    Граница `(?![\w.-])` пропускает `/`: `~/dev/gmb_v2/.claude/…` этот
+    репозиторий называет, а `~/dev/gmb` перед `_v2` — уже нет.
+    """
+    for pth in {display_path(repo), str(repo)}:
+        if re.search(re.escape(pth) + r"(?![\w.-])", text):
+            return True
+    return False
+
+
+def here_box():
+    """Ящик текущего каталога — для ПОРЯДКА печати дельты, не для отбора.
+
+    Каталог берётся у процесса: хук стартует в каталоге сессии. Проверяемо
+    соседним UserPromptSubmit-хуком — он зовёт голый `git rev-parse` и печатает
+    ветку, а `~` не репозиторий вовсе, значит стартовал он не в `~`.
+
+    Отказ git — не повод остаться без дельты: None значит «порядок прежний», а
+    не «дельта пустая» (Р16).
+    """
+    try:
+        return repo_box()
+    except Exception:
+        return None
+
+
+def close_to(row, here):
+    """Строка «своя» текущему каталогу — по ящику ЛИБО по entry.
+
+    Одного ящика мало, и это замерено: у `gmb_v2` проектный ящик недоступен
+    (основной чекаут отцеплен нарочно, main держит ворктри deploy-main), и 13
+    его строк живут в ящике дома. Порядок по одному ящику отрезал бы от сессии
+    ровно то, что к её проекту и относится.
+    """
+    if here is None:
+        return False
+    if row.box.repo_id == here.repo_id:
+        return True
+    if here.repo is None:
+        return False
+    f = row.fields.get("entry")
+    return bool(f) and names_repo(f.value, here.repo)
+
+
 def wake():
     """Дельта на старте сессии. Собирается В ПАМЯТИ и печатается одним куском.
 
@@ -1055,10 +1107,35 @@ def wake():
     lines = ["РЕЕСТР НЕ-СЕЙЧАС-РАБОТЫ — дельта на старте сессии."]
     if broken:
         lines.append(f"🔴 реестр молчит: {broken}")
-    for row, kinds, c in sorted(items, key=lambda it: sort_key(it[0])):
-        lines.append(f"  {row.id}  {field_or(row, 'title', '(без title)')}")
-        for kind, key in kinds:
-            lines.append(f"      • {why_line(kind, key, row, c)}")
+    # ПОРЯДОК, а не отбор. Дельта глобальна по построению — хук в
+    # ~/.claude/settings.json стартует в любом проекте, — и это верно: строка
+    # ждёт СОБЫТИЯ, а не твоего захода в её каталог. Спрятать чужое значило бы
+    # вернуть ровно ту потерю, против которой реестр и заведён. Но шесть
+    # созревших строк чужих репозиториев в каждой сессии — налог на внимание, и
+    # платится он порядком дешевле, чем слепотой.
+    here = here_box()
+    near, far = [], []
+    for it in items:
+        (near if close_to(it[0], here) else far).append(it)
+    # Заголовки печатаются, только когда есть что различать: над единственной
+    # группой заголовок не добавляет ни бита, а дельта стоит токенов на каждом
+    # старте любой сессии. Молчаливая перестановка при этом хуже отсутствия
+    # порядка — читатель не знает, почему список такой, и примет верх за всё.
+    where = (f"этот репозиторий: {here.repo.name}" if here and here.repo
+             else "ящик дома (~/.claude)")
+    if near and far:
+        groups = [(f"  — {where} —", near), ("  — другие ящики —", far)]
+    elif far:
+        groups = [("  — здесь созревшего нет; другие ящики —", far)]
+    else:
+        groups = [(None, near)]
+    for head, group in groups:
+        if head:
+            lines.append(head)
+        for row, kinds, c in sorted(group, key=lambda it: sort_key(it[0])):
+            lines.append(f"  {row.id}  {field_or(row, 'title', '(без title)')}")
+            for kind, key in kinds:
+                lines.append(f"      • {why_line(kind, key, row, c)}")
     lines.append("Это лежит в контексте, а НЕ на экране человека: назови дельту "
                  "вслух своими словами. Неназванная созревшая строка потеряна.")
     lines.append("`ack`, `taken` и `done` зовутся ТОЛЬКО по прямой просьбе "
