@@ -415,6 +415,7 @@ done
 # Пустой снимок (Ghostty не отвечает по AppleScript) означал бы пометку, которую
 # нечем снять: ровно так таб и остался с «derflow-parent-…» на экране.
 picked=0
+parent_win=""
 if [ -n "$parent_tty" ] && [ -w "$parent_tty" ]; then
   snap="$(gh_snapshot)"
   [ -n "$snap" ] || echo "⚠️  Ghostty не отвечает по AppleScript — метку не ставлю" >&2
@@ -431,7 +432,7 @@ tell application "Ghostty"
     repeat with t in tabs of w
       if (name of t) contains "$mark" then
         select tab t
-        return (id of t) as text
+        return ((id of w) & "|" & (id of t)) as text
       end if
     end repeat
   end repeat
@@ -441,6 +442,9 @@ AS
 )"
     [ -n "$mid" ] && break
   done
+  # Окно родителя — вторая половина ответа. Выбрать таб мало: доставка обязана
+  # НАЗВАТЬ окно, иначе она уедет в переднее (см. блок доставки ниже).
+  case "$mid" in *'|'*) parent_win="${mid%%|*}"; mid="${mid##*|}" ;; esac
   if [ -n "$mid" ]; then
     old="$(printf '%s\n' "$snap" | awk -v id="$mid" \
       '/^ID:/{cur=substr($0,4)} /^NM:/{if(cur==id){print substr($0,4); exit}}')"
@@ -451,7 +455,7 @@ AS
       echo "    Claude перепишет его сам на следующей смене состояния." >&2
     fi
     picked=1
-    echo "родительский таб выбран по tty ($parent_tty) — новый встанет рядом"
+    echo "родительский таб опознан по tty ($parent_tty), окно $parent_win"
   fi
 fi
 
@@ -463,19 +467,27 @@ if [ "$picked" = 0 ]; then
   as_sess="$(printf '%s' "$sess" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
   hits="$(osascript 2>/dev/null <<AS || true
 tell application "Ghostty"
-  set found to {}
+  set foundT to {}
+  set foundW to {}
   repeat with w in windows
     repeat with t in tabs of w
-      if (name of t) contains "$as_sess" then set end of found to t
+      if (name of t) contains "$as_sess" then
+        set end of foundT to t
+        set end of foundW to w
+      end if
     end repeat
   end repeat
-  if (count of found) is 1 then select tab (item 1 of found)
-  return (count of found) as text
+  if (count of foundT) is 1 then
+    select tab (item 1 of foundT)
+    return "1|" & (id of (item 1 of foundW))
+  end if
+  return (count of foundT) as text
 end tell
 AS
 )"
+  case "$hits" in *'|'*) parent_win="${hits##*|}"; hits="${hits%%|*}" ;; esac
   case "$hits" in
-    1) echo "родительский таб «${sess}» выбран по имени — новый встанет рядом" ;;
+    1) echo "родительский таб «${sess}» опознан по имени, окно $parent_win" ;;
     ""|0) echo "⚠️  родителя не опознать: tty нет и таба «${sess}» нет —" >&2
           echo "    новый встанет по умолчанию, не рядом" >&2 ;;
     *) echo "⚠️  табов с именем «${sess}»: ${hits} — родитель неоднозначен," >&2
@@ -483,6 +495,64 @@ AS
   esac
 fi
 
-# Без `-n`. Именно его отсутствие и делает это табом, а не новым инстансом.
-open -a Ghostty.app "$launcher"
-echo "таб Ghostty запрошен — новым табом в окне основного инстанса"
+# 🔴 Доставка НАЗЫВАЕТ окно, а не надеется на переднее (v4.35).
+#
+# Боевое 12.09.2026: родитель был опознан верно («выбран по tty /dev/ttys009»),
+# и таб всё равно встал в ДРУГОМ ОКНЕ — там, где в тот момент смотрел человек.
+# Словарь Ghostty различает две вещи, а скрипт знал одну: `select tab` выбирает
+# таб В ЕГО ОКНЕ и окно вперёд НЕ выводит, а `open -a` отдаёт документ
+# ПЕРЕДНЕМУ окну. Пока оба окна совпадали, подмена не замечалась.
+#
+# Ghostty 1.3.1 умеет `new tab in <окно> with configuration` — назначение
+# задаётся явно, фокус в расчёте не участвует. Замер: два пробных таба легли
+# ровно в названные окна, включая непереднее. Позиция внутри окна по-прежнему
+# от `window-new-tab-position = current`, поэтому родителя всё равно надо
+# выбрать ДО создания — это выше и делается.
+#
+# 🔴 Второе, что вскрылось тем же опытом: `open -a Ghostty.app <файл>` умеет
+# вернуть 0 и не открыть НИЧЕГО (дважды подряд из сессии под агентом). Тихий
+# отказ транспорта неотличим от «расщепление прошло». Поэтому LaunchServices
+# оставлен только последним рубежом, и его исход теперь называется вслух.
+asq() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+as_launcher="$(asq "$launcher")"
+as_dir="$(asq "$dir")"
+
+# deliver <id окна|пусто> → id нового таба, либо пусто. Пусто на входе — переднее
+# окно: таб без опознанного родителя всё же лучше молчания.
+deliver() {
+  osascript 2>/dev/null <<AS || true
+tell application "Ghostty"
+  set target to missing value
+  if "$1" is "" then
+    set target to front window
+  else
+    repeat with w in windows
+      if (id of w) is "$1" then set target to w
+    end repeat
+  end if
+  if target is missing value then return ""
+  set cfg to new surface configuration
+  set command of cfg to "$as_launcher"
+  set initial working directory of cfg to "$as_dir"
+  set wait after command of cfg to true
+  set nt to new tab in target with configuration cfg
+  activate window target
+  select tab nt
+  return (id of nt) as text
+end tell
+AS
+}
+
+opened="$(deliver "$parent_win")"
+if [ -n "$opened" ] && [ -n "$parent_win" ]; then
+  echo "таб открыт рядом с родителем: окно $parent_win, таб $opened"
+elif [ -n "$opened" ]; then
+  echo "⚠️  родитель не опознан — таб открыт в ПЕРЕДНЕМ окне ($opened)," >&2
+  echo "    рядом с родителем он не гарантирован." >&2
+else
+  # Без `-n`. Именно его отсутствие и делает это табом, а не новым инстансом.
+  open -a Ghostty.app "$launcher"
+  echo "⚠️  прямая доставка не отработала (Ghostty старше 1.3.1?) — отдал файл" >&2
+  echo "    через LaunchServices: таб встанет в переднем окне, и если он НЕ" >&2
+  echo "    появился вовсе — расщепление не состоялось, зови ещё раз." >&2
+fi
