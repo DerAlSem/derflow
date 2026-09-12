@@ -130,7 +130,10 @@
 #   { [ "$rc" = 0 ] && has "заведена:"; }; is "ярлык укуса" $?
 set -u
 W="${WAITING:-$HOME/.claude/scripts/waiting.py}"
-ROOT="$(mktemp -d)"; trap 'rm -rf "$ROOT"' EXIT
+# stderr у teardown заглушён НАМЕРЕННО: отцепленный фон (см. ⚠️ выше) пишет в уже
+# удалённый $ROOT, и `rm -rf` выходит с ENOTEMPTY. Жалоба печаталась ПОСЛЕ строки
+# итога и читалась как провал зелёного прогона. Осадок — пустые каталоги в mktemp.
+ROOT="$(mktemp -d)"; trap 'rm -rf "$ROOT" 2>/dev/null || true' EXIT
 export WAITING_HOME="$ROOT/home"     # ящик, кэш и корни — НЕ в живой ~/.claude
 mkdir -p "$WAITING_HOME" "$ROOT/repos"
 # ~/.claude в жизни — репозиторий git, и стенд обязан воспроизводить это, иначе
