@@ -50,8 +50,8 @@ SKILLDIR = os.environ.get("CANON_DRIFT_SKILLDIR") or os.path.expanduser(
 SKILL = "SKILL.md"
 GRACE = 60          # с; правка в пределах минуты после касания — своя же
 STATE_DIR = os.path.expanduser("~/.claude/state")
-# CHANGELOG.md намеренно вне канона: это история, а не правила поведения,
-# и она не грузится в контекст на каждой задаче.
+# archive/CHANGELOG.md намеренно вне канона: это история, а не правила
+# поведения, и она не грузится в контекст на каждой задаче.
 
 
 def canon():
