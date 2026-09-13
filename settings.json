@@ -46,7 +46,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Skill|Bash",
+        "matcher": "Skill|Bash|Task|Agent",
         "hooks": [
           {
             "type": "command",

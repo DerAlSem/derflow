@@ -26,6 +26,17 @@ case "$tool" in
     esac
     args=$(printf '%s' "$payload" | jq -r '.tool_input.args // empty')
     ;;
+  Task|Agent)
+    sub=$(printf '%s' "$payload" | jq -r '.tool_input.subagent_type // empty')
+    case "$sub" in
+      system-architect|gap-finder) ;;
+      *) exit 0 ;;
+    esac
+    # круг ОТКРЫВАЮТ — блокируем, если отметка по этой заявке ещё действует
+    args=$(printf '%s' "$payload" | jq -r '.tool_input.prompt // empty')
+    second_circle=1
+    gated=1
+    ;;
   Bash)
     cmd=$(printf '%s' "$payload" | jq -r '.tool_input.command // empty')
     case "$cmd" in
@@ -69,6 +80,18 @@ cur=$(cd "$specs" && find . -type f -name '*.md' | LC_ALL=C sort | while IFS= re
   shasum -a 256 "$f" | cut -d' ' -f1
 done | shasum -a 256 | cut -d' ' -f1)
 [ -n "$cur" ] || exit 0
+
+if [ "${second_circle:-0}" -eq 1 ]; then
+  mark="$changes_dir/$id/.critique"
+  if [ -f "$mark" ] && [ "$(head -1 "$mark")" = "$cur" ]; then
+    echo "🔴 Слой критики по «${id}» уже закрыт по ТЕКУЩЕЙ редакции спеки" \
+         "($(sed -n 2p "$mark")). Слой закрыт по счёту: один круг." \
+         "Дальше — механика: check.py, дифф имён сценариев, N→SHALL." \
+         "Каталог отговорок: skills/derflow/archive/critic-ceiling.md" >&2
+    exit 2
+  fi
+  exit 0
+fi
 
 marker="$changes_dir/$id/.critique"
 rec=""
