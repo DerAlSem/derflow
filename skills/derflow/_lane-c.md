@@ -52,7 +52,7 @@ brainstorming → /opsx:explore → /opsx:propose
   подтверждённое, остальное пометь `unbacked`; всё `unbacked` → в бэклог; `contradicted` →
   громче всех. Справочник — `~/.claude/skills/_conformance-sweep.md`.
 - Отсутствие `normative` baseline тут НЕ блокер: вопрос «реализует ли код то, что дельта
-  утверждает». Потолок стоимости ставится ДО фанаута: «N SHALL × ~50k ≈ X».
+  утверждает». Потолок стоимости ставится ДО фанаута: «N SHALL × цена воркера ≈ X».
 
 ## Спека читается первой → archive/spec-first.md
 
