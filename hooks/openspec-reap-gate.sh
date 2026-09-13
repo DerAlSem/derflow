@@ -29,15 +29,18 @@ if [ -n "$default_ref" ]; then
 fi
 
 # кандидат-множество 1: заявки, тронутые в рабочем дереве
-wt_names=$(git status --porcelain -- openspec/changes 2>/dev/null \
-  | grep -oE 'openspec/changes/[^/[:space:]]+' \
+# -z + core.quotepath=false: имена с не-ASCII/пробелом/кавычкой не экранируются и не квотируются
+wt_names=$(git -c core.quotepath=false status --porcelain -z -- openspec/changes 2>/dev/null \
+  | tr '\0' '\n' \
+  | grep -oE 'openspec/changes/[^/]+' \
   | sed 's#openspec/changes/##')
 
 # кандидат-множество 2: заявки, тронутые коммитами этой ветки от точки расхождения
 commit_names=""
 if [ -n "$merge_base" ]; then
-  commit_names=$(git log --name-only --pretty=format: "$merge_base"..HEAD -- openspec/changes 2>/dev/null \
-    | grep -oE 'openspec/changes/[^/[:space:]]+' \
+  commit_names=$(git -c core.quotepath=false log --name-only -z --pretty=format: "$merge_base"..HEAD -- openspec/changes 2>/dev/null \
+    | tr '\0' '\n' \
+    | grep -oE 'openspec/changes/[^/]+' \
     | sed 's#openspec/changes/##')
 fi
 
