@@ -15,6 +15,11 @@
             "type": "command",
             "command": "python3 $HOME/.claude/scripts/waiting.py wake",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/scripts/canon-budget.py || true",
+            "timeout": 5
           }
         ]
       }
