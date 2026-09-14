@@ -23,26 +23,67 @@
 файла, пауза — из его mtime. Файл на сессию, поэтому сестринские сессии не
 топчут друг друга.
 """
-import json, os, subprocess, sys, time
+import json, os, re, subprocess, sys, time
 
 TAIL_BYTES = 4_000_000       # хвост транскрипта; полный файл бывает сотнями МБ
 WARN, LOUD = 150_000, 300_000
+# Вторая полоса в сессии = граница СЕССИЙ (derflow/SKILL.md). Замер 14.09.2026:
+# 137 сессий со вторым анонсом потратили ПОСЛЕ него $29k из $55,7k всего счёта,
+# а по полосе второго анонса разрыв восьмикратный — A $26 и D $34 за сессию
+# против B $243, C $198, Dx $309, F $679. Отсюда и список исключений.
+ANNOUNCE = re.compile(r"\*{0,2}Lane\s+([^\n\u2192]{1,40}?)\s*\u2192")
+STAY = ("A", "D")            # тривиальное и консультация чинятся ЗДЕСЬ
 PAUSE_SEC = 2 * 3600         # ниже — перерыв, а не возврат к отложенной задаче
 STALE_SEC = 30 * 86_400      # мёртвые файлы состояния
 STATE_DIR = os.path.expanduser("~/.claude/state")
 
 
-def last_context(path):
+def tail_lines(path):
+    """Хвост транскрипта строками. Отдельно от разбора: за один вызов хука он
+    нужен и контексту, и детектору анонсов — читать файл дважды незачем."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
             if size > TAIL_BYTES:
                 f.seek(size - TAIL_BYTES)
                 f.readline()          # выбросить обрезанную строку
-            lines = f.read().decode("utf-8", "replace").splitlines()
+            return f.read().decode("utf-8", "replace").splitlines()
     except OSError:
         return None
-    for line in reversed(lines):
+
+
+def lanes(lines):
+    """Полосы анонсов по порядку. Только ТЕКСТ ассистента: в tool_result лежит
+    сам SKILL.md с шаблоном «Lane `<id>` → `<agent>`» и совпал бы (урок cost.py).
+    Сабагент отсеивается — его анонс не наш.
+
+    Хвост в 4 МБ: у очень длинной сессии первый анонс может из него выпасть, и
+    тогда детектор просто не сработает. Промолчать здесь дешевле, чем соврать.
+    Проверка по корпусу 14.09.2026: детектор видит 104 перехода из 137 найденных
+    полным проходом (76%), остальные срезал хвост. Это потолок, а не поломка.
+    """
+    out = []
+    for line in lines or ():
+        if '"assistant"' not in line or "Lane" not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") != "assistant" or d.get("isSidechain"):
+            continue
+        for b in (d.get("message") or {}).get("content") or []:
+            if not (isinstance(b, dict) and b.get("type") == "text"):
+                continue
+            m = ANNOUNCE.search(b.get("text", ""))
+            if m:
+                out.append(m.group(1).replace("`", "").strip(" *"))
+                break
+    return out
+
+
+def context_from(lines):
+    for line in reversed(lines or []):
         if '"usage"' not in line:
             continue
         try:
@@ -57,6 +98,10 @@ def last_context(path):
         return (u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
                 + u.get("cache_read_input_tokens", 0))
     return None
+
+
+def last_context(path):
+    return context_from(tail_lines(path))
 
 
 def current_branch(cwd):
@@ -127,8 +172,26 @@ def loud_msg():
             "~/.claude/scripts/hand.sh <каталог> (derflow/_capture.md)")
 
 
+def lane2_msg(lane):
+    return (f"‼ вторая полоса в сессии ({lane}) — она открывается НОВОЙ сессией: "
+            "допиши хендофф до «здесь и сейчас» и позови "
+            "~/.claude/scripts/hand.sh <каталог> [файл] (derflow/SKILL.md)")
+
+
+def claim(latch):
+    """Защёлка «один раз за сессию». Гонку выигрывает тот, кто создал файл."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        os.close(os.open(latch, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+    except FileExistsError:
+        return False
+    except OSError:
+        return True                   # защёлку не поставили — лучше дважды, чем ни разу
+    return True
+
+
 def main_tool():
-    """Вход для `PostToolUse`. Печатает порог РОВНО ОДИН РАЗ за сессию.
+    """Вход для `PostToolUse`. Печатает РОВНО ОДИН РАЗ за сессию — каждое из двух.
 
     🔴 Зачем отдельный вход. `UserPromptSubmit` меряет на РЕПЛИКЕ, а дорожает
     сессия на ХОДАХ. Замер 12.09.2026, `V·хвосты слияния` (82cae91b): одна
@@ -149,21 +212,32 @@ def main_tool():
     session = payload.get("session_id")
     if not session:
         return 0
-    latch = os.path.join(STATE_DIR, f"{session}.loud")
-    # Дешёвая сторона вперёд: после первого раза хук не читает транскрипт вовсе.
-    if os.path.exists(latch):
+    loud_latch = os.path.join(STATE_DIR, f"{session}.loud")
+    lane2_latch = os.path.join(STATE_DIR, f"{session}.lane2")
+    need_loud = not os.path.exists(loud_latch)
+    need_lane2 = not os.path.exists(lane2_latch)
+    # Дешёвая сторона вперёд: когда обе защёлки стоят, транскрипт не читается.
+    if not (need_loud or need_lane2):
         return 0
-    n = last_context(payload.get("transcript_path") or "")
-    if not n or n < LOUD:
-        return 0
-    try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        os.close(os.open(latch, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
-    except FileExistsError:
-        return 0                      # гонка: печатает тот, кто поставил защёлку
-    except OSError:
-        pass                          # защёлку не поставили — лучше дважды, чем ни разу
-    print(f"ctx: {n / 1000:.0f}k {loud_msg()}")
+    lines = tail_lines(payload.get("transcript_path") or "")
+
+    out = []
+    # Событие вперёд уровня: смена полосы — это ПЕРЕХОД, и он адресный,
+    # тогда как «ctx: 384k» лишь состояние. Порог 300k тут сработать не успевает:
+    # медиана контекста на втором анонсе — 182k, он ловит 27 сессий из 137.
+    if need_lane2:
+        seen = lanes(lines)
+        # Сравнение ТОЧНОЕ по первому токену: `startswith` посчитал бы `Dx`
+        # исключением по букве D, а Dx вторым анонсом — $309 за сессию.
+        head = re.split(r"[\s\u00b7(,]", seen[1], maxsplit=1)[0] if len(seen) >= 2 else ""
+        if len(seen) >= 2 and head not in STAY and claim(lane2_latch):
+            out.append(lane2_msg(seen[1]))
+    if need_loud:
+        n = context_from(lines)
+        if n and n >= LOUD and claim(loud_latch):
+            out.append(f"ctx: {n / 1000:.0f}k {loud_msg()}")
+    if out:
+        print("\n".join(out))
     return 0
 
 
