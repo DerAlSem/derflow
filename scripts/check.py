@@ -136,6 +136,7 @@ PTR_MAX = 120                      # знаков в строке-указате
 LIVES = re.compile(r"^\s*живёт до:\s*(\S.*?)\s*$", re.M)
 DATE = re.compile(r"\b(\d{2})\.(\d{2})\.(\d{4})\b")
 IDXROW = re.compile(r"^\s*[-*]\s*\[[^\]]*\]\(([^)]+\.md)\)", re.M)
+SUPERS = re.compile(r"^\s*supersedes:\s*(\S.*?)\s*$", re.M)
 
 
 def hygiene(mem, memfiles, today=None):
@@ -153,7 +154,7 @@ def hygiene(mem, memfiles, today=None):
     memfiles = [f for f in memfiles if f.name != "MEMORY.md"]
     h = {"есть": bool(memfiles), "истёк": [], "прозой": 0, "без срока": [],
          "сироты": [], "битые": [], "длинные": [], "самая длинная": None,
-         "байт": 0, "строк": 0}
+         "вытеснены": [], "байт": 0, "строк": 0}
     if not memfiles:
         return h
 
@@ -162,6 +163,10 @@ def hygiene(mem, memfiles, today=None):
             head = f.read_text(encoding="utf-8")[:2000]
         except OSError:
             continue
+        # Собирается ДО разбора срока: ниже стоят ранние `continue`, и запись,
+        # объявившая вытеснение, но не объявившая срок, потеряла бы `supersedes`.
+        for s in SUPERS.findall(head):
+            h["вытеснены"].extend(n.strip().strip("`") for n in s.split(",") if n.strip())
         m = LIVES.search(head)
         if not m:
             h["без срока"].append(f.name)
@@ -202,7 +207,11 @@ def hygiene(mem, memfiles, today=None):
     named = {t.split("/")[-1] for t in IDXROW.findall(text)}
     have = {f.name for f in memfiles}
     h["битые"] = sorted(named - have)
-    h["сироты"] = sorted(have - named)
+    # Вытесненная запись по построению НЕ в индексе: канон велит убрать её строку,
+    # а тело оставить находимым. Сторож, звавший её сиротой, краснел на ПРАВИЛЬНОМ
+    # состоянии — и тем учил себя игнорировать. Имя в `supersedes` — это `name`
+    # записи, файл её — `<name>.md`; сводится по этому правилу, не по строке.
+    h["сироты"] = sorted(have - named - {n + ".md" for n in h["вытеснены"]})
     return h
 
 
@@ -232,6 +241,9 @@ def report_hygiene(h):
           f"датой — {len(h['истёк'])} истёкших")
     if h["прозой"]:
         print("           прозой объявленный срок НИКТО НЕ СТОРОЖИТ — это отчёт, не гейт")
+    if h["вытеснены"]:
+        print(f"  вытеснено {len(h['вытеснены'])} — тело на месте, строки в индексе "
+              f"нет ПО КАНОНУ: {', '.join(sorted(h['вытеснены']))}")
     for name, val in h["истёк"]:
         print(f"  ✗ {name} — срок истёк: {val}")
     for name in h["битые"]:
@@ -423,10 +435,18 @@ def selftest_hygiene():
             "---\nname: rotten\nmetadata:\n  живёт до: до выката 01.01.2020\n---\n\nтело\n")
         (memd / "bare.md").write_text("---\nname: bare\n---\n\nтело\n")
         (memd / "orphan.md").write_text("---\nname: orphan\n---\n\nтело\n")
+        # Пара «вытесненная — вытеснившая»: ровно то состояние, которое канон
+        # считает ПРАВИЛЬНЫМ, а сторож до 14.09.2026 печатал сиротой.
+        (memd / "old.md").write_text(
+            "---\nname: old\nmetadata:\n  живёт до: до выката 01.01.2030\n---\n\nтело\n")
+        (memd / "new.md").write_text(
+            "---\nname: new\nsupersedes: old\nmetadata:\n"
+            "  живёт до: до выката 01.01.2030\n---\n\nтело\n")
         (memd / "MEMORY.md").write_text(
             "- [Ловушка](trap.md) — коротко\n"
             "- [Протухла](rotten.md) — коротко\n"
             "- [Голая](bare.md) — " + "х" * 200 + "\n"
+            "- [Сменщица](new.md) — вытеснила old\n"
             "- [Призрак](gone.md) — указатель в никуда\n")
 
         # Набор отдаётся ТАК ЖЕ, как его отдаёт run() — вместе с самим индексом.
@@ -444,6 +464,8 @@ def selftest_hygiene():
             ("проза посчитана отдельно", h["прозой"] == 1),
             ("битый указатель пойман", h["битые"] == ["gone.md"]),
             ("сирота поймана", h["сироты"] == ["orphan.md"]),
+            ("вытесненная сиротой НЕ считается", "old.md" not in h["сироты"]),
+            ("вытеснение замечено поимённо", h["вытеснены"] == ["old"]),
             ("длинная строка поймана", len(h["длинные"]) == 1),
         ]
         for label, good in checks:
@@ -459,6 +481,17 @@ def selftest_hygiene():
             print("✓ укус: дописанный срок снял ровно одну находку")
         else:
             print(f"✗ укус не сработал: было {before}, стало {after}")
+            ok = False
+
+        # второй укус: снимаем `supersedes` — вытесненная обязана СТАТЬ сиротой.
+        # Без него послабление неотличимо от «сирот не ловим вовсе».
+        (memd / "new.md").write_text(
+            "---\nname: new\nmetadata:\n  живёт до: до выката 01.01.2030\n---\n\nтело\n")
+        sir = hygiene(memd, files(), today=datetime.date(2026, 9, 6))["сироты"]
+        if sir == ["old.md", "orphan.md"]:
+            print("✓ укус: снятый supersedes вернул вытесненную в сироты")
+        else:
+            print(f"✗ укус supersedes не сработал: сироты {sir}")
             ok = False
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
