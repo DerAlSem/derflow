@@ -128,5 +128,6 @@
       "**Org-specific CLIs**: None configured",
       "**Routine under this repo's prefix**: edits to agents, skills, commands and CLAUDE.md files inside /Users/deralsem/.claude are routine; the repo is itself the Claude config directory, so treat changes to its own settings and skills as self-modification-adjacent and confirm before rewriting auto-mode or permission files"
     ]
-  }
+  },
+  "tui": "fullscreen"
 }
